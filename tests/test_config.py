@@ -3,6 +3,15 @@ from src.common.config import Config
 
 
 class TestConfig:
+
+    def test_env_collision(self, monkeypatch):
+        monkeypatch.setenv("AO_APP_PORT", "8081")
+        monkeypatch.setenv("AO_app_port", "8082")
+        with pytest.raises(ValueError) as exc:
+            Config()
+        assert "Case collision detected" in str(exc.value)
+        assert "AO_APP_PORT" in str(exc.value)
+        assert "AO_app_port" in str(exc.value)
     def test_load_config(self, tmp_path):
         config_file = tmp_path / "config.json"
         config_file.write_text('{"app": {"name": "test", "port": 8080}}')

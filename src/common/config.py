@@ -18,9 +18,13 @@ class Config:
 
     def _load_env_overrides(self) -> None:
         prefix = "AO_"
+        mapped_keys = {}
         for key, value in os.environ.items():
             if key.startswith(prefix):
                 config_key = key[len(prefix):].lower().replace("_", ".")
+                if config_key in mapped_keys:
+                    raise ValueError(f"Case collision detected for env overrides: '{mapped_keys[config_key]}' and '{key}' both map to '{config_key}'")
+                mapped_keys[config_key] = key
                 self._set_nested(config_key, value)
 
     def _set_nested(self, key: str, value: Any) -> None:
