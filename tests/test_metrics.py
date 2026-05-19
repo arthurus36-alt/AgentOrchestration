@@ -136,3 +136,9 @@ class TestMetricsCollector:
 # 2026-03-24T19:28:19 update
 
 # 2026-04-10T18:10:10 update
+    def test_stop_timer_no_deadlock(self):
+        # Regression test: ensure stop_timer does not deadlock on lock re-entry
+        self.metrics.start_timer("deadlock_test")
+        self.metrics.stop_timer("deadlock_test")
+        snapshot = self.metrics.snapshot()
+        assert snapshot["histograms"]["deadlock_test"]["count"] == 1
