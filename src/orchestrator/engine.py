@@ -62,6 +62,8 @@ class OrchestrationEngine:
             )
             self.registry.update_status(agent_id, AgentStatus.PAUSED)
 
+            self.scheduler.complete(task_id)
+
             for hook in self._hooks["post_execute"]:
                 await hook(task, result)
 
@@ -69,6 +71,9 @@ class OrchestrationEngine:
 
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}")
+            self.scheduler.fail(task_id)
+            if self.registry.get(agent_id):
+                self.registry.update_status(agent_id, AgentStatus.FAILED)
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
 

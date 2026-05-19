@@ -38,19 +38,23 @@ class TaskScheduler:
         self._max_retries = 3
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        if "id" not in task:
+            task["id"] = str(uuid4())
+        if "enqueued_at" not in task:
+            task["enqueued_at"] = time.time()
+        if "retries" not in task:
+            task["retries"] = 0
 
+        task_id = task["id"]
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
+        if "id" not in task:
+            task["id"] = str(uuid4())
+        task_id = task["id"]
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
