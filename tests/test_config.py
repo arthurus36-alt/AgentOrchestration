@@ -3,6 +3,14 @@ from src.common.config import Config
 
 
 class TestConfig:
+
+    def test_load_config_invalid_json(self, tmp_path):
+        config_file = tmp_path / "invalid.json"
+        config_file.write_text('{"app": {"name": "test", }')
+        with pytest.raises(ValueError) as exc:
+            Config(str(config_file))
+        assert "invalid.json" in str(exc.value)
+        assert "Failed to parse config file" in str(exc.value)
     def test_load_config(self, tmp_path):
         config_file = tmp_path / "config.json"
         config_file.write_text('{"app": {"name": "test", "port": 8080}}')
