@@ -30,7 +30,7 @@ class AgentRegistry:
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": config or {}, "config_version": 1,
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
