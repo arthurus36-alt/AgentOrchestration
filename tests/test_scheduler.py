@@ -3,6 +3,14 @@ from src.orchestrator.scheduler import TaskScheduler
 
 
 class TestTaskScheduler:
+
+    def test_schedule_task(self):
+        task_id = self.scheduler.schedule({"type": "scheduled"}, 0)
+        assert task_id is not None
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task is not None
+        assert task["type"] == "scheduled"
     def setup_method(self):
         self.scheduler = TaskScheduler()
 

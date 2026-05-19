@@ -34,6 +34,7 @@ class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
+        self._scheduled_tasks: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
 
@@ -52,13 +53,15 @@ class TaskScheduler:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
+        self._scheduled_tasks[task_id] = task
         return task_id
 
     async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
-            task = self._scheduled.pop(tid)
+            self._scheduled.pop(tid)
+            task = self._scheduled_tasks.pop(tid, None)
             if task:
                 self.enqueue(task, queue)
 
