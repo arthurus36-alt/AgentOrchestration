@@ -4,6 +4,21 @@ from src.common.config import Config
 
 class TestConfig:
 
+    def test_branch_replacement_conflict(self, monkeypatch):
+        # Setting up a dictionary tree
+        config = Config()
+        config.set("app.settings.port", 8080)
+        
+        # Override scalar onto a branch
+        with pytest.raises(ValueError) as exc:
+            config.set("app.settings", "scalar_value")
+        assert "cannot replace existing branch" in str(exc.value)
+
+        # Override nested key onto a scalar
+        with pytest.raises(ValueError) as exc:
+            config.set("app.settings.port.nested", "value")
+        assert "trying to set nested key under scalar branch" in str(exc.value)
+
     def test_numeric_coercion(self, monkeypatch):
         monkeypatch.setenv("AO_APP_PORT", "8080")
         monkeypatch.setenv("AO_RETRY_DELAY", "1.5")

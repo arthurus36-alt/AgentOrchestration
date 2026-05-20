@@ -41,8 +41,14 @@ class Config:
         for part in parts[:-1]:
             if part not in current:
                 current[part] = {}
+            elif not isinstance(current[part], dict):
+                raise ValueError(f"Config conflict: trying to set nested key under scalar branch '{part}'")
             current = current[part]
-        current[parts[-1]] = value
+        
+        last_part = parts[-1]
+        if last_part in current and isinstance(current[last_part], dict) and not isinstance(value, dict):
+            raise ValueError(f"Config conflict: scalar override '{key}' cannot replace existing branch '{last_part}'")
+        current[last_part] = value
 
     def get(self, key: str, default: Any = None) -> Any:
         parts = key.split(".")
