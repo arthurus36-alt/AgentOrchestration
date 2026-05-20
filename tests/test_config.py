@@ -3,6 +3,20 @@ from src.common.config import Config
 
 
 class TestConfig:
+
+    def test_get_int(self):
+        config = Config()
+        config.set("limits.memory", "1024")
+        config.set("limits.timeout", 30)
+        
+        assert config.get_int("limits.memory") == 1024
+        assert config.get_int("limits.timeout") == 30
+        assert config.get_int("limits.missing", 5) == 5
+        
+        config.set("limits.invalid", "hello")
+        with pytest.raises(ValueError) as exc:
+            config.get_int("limits.invalid")
+        assert "cannot be converted to an integer" in str(exc.value)
     def test_load_config(self, tmp_path):
         config_file = tmp_path / "config.json"
         config_file.write_text('{"app": {"name": "test", "port": 8080}}')

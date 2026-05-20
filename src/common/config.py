@@ -44,6 +44,13 @@ class Config:
                 return default
         return current
 
+    def get_int(self, key: str, default: int = 0) -> int:
+        val = self.get(key, default)
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            raise ValueError(f"Config value at '{key}' cannot be converted to an integer.")
+
     def set(self, key: str, value: Any) -> None:
         self._set_nested(key, value)
 
