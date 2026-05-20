@@ -3,7 +3,6 @@
 import argparse
 import sys
 
-from src.common.config import Config
 from src.common.logging import configure_logging
 
 
@@ -37,6 +36,11 @@ def cli():
     if args.command == "init":
         print(f"Initializing project: {args.name}")
     elif args.command == "deploy":
+        import os
+        if not os.path.exists(args.manifest):
+            print(f"Error: Manifest file '{args.manifest}' does not exist.")
+            sys.exit(1)
+            return
         print(f"Deploying agent from manifest: {args.manifest}")
     elif args.command == "status":
         print("Checking agent status...")
