@@ -37,6 +37,10 @@ def cli():
     if args.command == "init":
         print(f"Initializing project: {args.name}")
     elif args.command == "deploy":
+        import os
+        if not os.path.exists(args.manifest):
+            print(f"Error: Manifest file not found: {args.manifest}", file=sys.stderr)
+            sys.exit(1)
         print(f"Deploying agent from manifest: {args.manifest}")
     elif args.command == "status":
         print("Checking agent status...")
