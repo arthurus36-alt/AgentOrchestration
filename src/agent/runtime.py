@@ -28,6 +28,10 @@ class AgentRuntime:
             logger.warning(f"Agent {agent_id} is already running")
             return False
 
+        if env and "AO_AGENT_ID" in env:
+            logger.error("Cannot override reserved environment variable AO_AGENT_ID")
+            return False
+
         self._states[agent_id] = RuntimeState.STARTING
         process_env = os.environ.copy()
         if env:
