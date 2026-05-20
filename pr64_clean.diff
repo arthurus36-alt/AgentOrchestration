@@ -1,0 +1,432 @@
+diff --git a/src/orchestrator/webhooks.py b/src/orchestrator/webhooks.py
+new file mode 100644
+index 00000000..c9b654e7
+--- /dev/null
++++ b/src/orchestrator/webhooks.py
+@@ -0,0 +1,253 @@
++"""Webhook endpoint registration and public payload shaping."""
++
++import time
++from dataclasses import dataclass, field
++from typing import Any, Callable, Dict, List, Optional, Tuple
++from urllib.parse import urlparse
++from uuid import uuid4
++
++
++INTERNAL_FIELD_PREFIXES = ("_", "internal_")
++INTERNAL_FIELD_NAMES = {
++    "api_key",
++    "authorization",
++    "headers",
++    "password",
++    "private_key",
++    "secret",
++    "token",
++}
++
++
++@dataclass
++class WebhookEndpoint:
++    id: str
++    workspace_id: str
++    url: str
++    secret: str = field(repr=False)
++    enabled: bool = True
++    version: int = 1
++    created_at: float = field(default_factory=time.time)
++    updated_at: float = field(default_factory=time.time)
++
++
++@dataclass
++class WebhookDeliveryRecord:
++    id: str
++    endpoint_id: str
++    workspace_id: str
++    event: str
++    payload: Dict[str, Any]
++    status: str
++    attempts: int = 1
++    reason: Optional[str] = None
++    created_at: float = field(default_factory=time.time)
++
++
++class WebhookDeliveryService:
++    def __init__(self):
++        self._endpoints: Dict[str, WebhookEndpoint] = {}
++        self._deliveries: Dict[Tuple[str, str, str], WebhookDeliveryRecord] = {}
++        self._callbacks: Dict[str, List[Callable[[WebhookDeliveryRecord], None]]] = {}
++
++    def register_endpoint(self, workspace_id: str, url: str, secret: str) -> WebhookEndpoint:
++        self._validate_workspace(workspace_id)
++        self._validate_url(url)
++        endpoint = WebhookEndpoint(
++            id=str(uuid4()),
++            workspace_id=workspace_id,
++            url=url,
++            secret=secret,
++        )
++        self._endpoints[endpoint.id] = endpoint
++        return endpoint
++
++    def endpoints(self, workspace_id: str) -> List[WebhookEndpoint]:
++        return [
++            endpoint
++            for endpoint in self._endpoints.values()
++            if endpoint.workspace_id == workspace_id
++        ]
++
++    def disable_endpoint(self, endpoint_id: str) -> bool:
++        endpoint = self._endpoints.get(endpoint_id)
++        if not endpoint:
++            return False
++        endpoint.enabled = False
++        endpoint.updated_at = time.time()
++        return True
++
++    def rotate_endpoint(
++        self,
++        endpoint_id: str,
++        *,
++        url: Optional[str] = None,
++        secret: Optional[str] = None,
++    ) -> WebhookEndpoint:
++        endpoint = self._require_endpoint(endpoint_id)
++        if url is not None:
++            self._validate_url(url)
++            endpoint.url = url
++        if secret is not None:
++            endpoint.secret = secret
++        endpoint.version += 1
++        endpoint.enabled = True
++        endpoint.updated_at = time.time()
++        return endpoint
++
++    def register_callback(
++        self,
++        event: str,
++        callback: Callable[[WebhookDeliveryRecord], None],
++    ) -> None:
++        self._callbacks.setdefault(event, []).append(callback)
++
++    def deliver(
++        self,
++        endpoint_id: str,
++        workspace_id: str,
++        event: str,
++        data: Dict[str, Any],
++        idempotency_key: str,
++        *,
++        endpoint_version: Optional[int] = None,
++        sender: Optional[Callable[[WebhookEndpoint, Dict[str, Any]], Any]] = None,
++    ) -> WebhookDeliveryRecord:
++        if not idempotency_key:
++            raise ValueError("idempotency_key is required")
++
++        delivery_key = (endpoint_id, workspace_id, idempotency_key)
++        existing = self._deliveries.get(delivery_key)
++        if existing and existing.status in {"delivered", "rejected"}:
++            return existing
++
++        endpoint = self._endpoints.get(endpoint_id)
++        reason = self._rejection_reason(endpoint, workspace_id, endpoint_version)
++        if reason:
++            return self._store_delivery(
++                delivery_key,
++                endpoint_id,
++                workspace_id,
++                event,
++                {},
++                "rejected",
++                reason,
++            )
++
++        payload = existing.payload if existing else {
++            "event": event,
++            "workspace_id": workspace_id,
++            "data": self._shape_public_payload(data),
++        }
++        attempts = existing.attempts + 1 if existing else 1
++
++        if sender and endpoint:
++            try:
++                response = sender(endpoint, payload)
++                status_code = int(response or 200)
++            except Exception as exc:
++                return self._store_delivery(
++                    delivery_key,
++                    endpoint_id,
++                    workspace_id,
++                    event,
++                    payload,
++                    "failed",
++                    exc.__class__.__name__,
++                    attempts,
++                )
++            if not 200 <= status_code < 300:
++                return self._store_delivery(
++                    delivery_key,
++                    endpoint_id,
++                    workspace_id,
++                    event,
++                    payload,
++                    "failed",
++                    f"http_status_{status_code}",
++                    attempts,
++                )
++
++        record = self._store_delivery(
++            delivery_key,
++            endpoint_id,
++            workspace_id,
++            event,
++            payload,
++            "delivered",
++            attempts=attempts,
++        )
++        for callback in self._callbacks.get(event, []):
++            callback(record)
++        return record
++
++    def _store_delivery(
++        self,
++        delivery_key: Tuple[str, str, str],
++        endpoint_id: str,
++        workspace_id: str,
++        event: str,
++        payload: Dict[str, Any],
++        status: str,
++        reason: Optional[str] = None,
++        attempts: int = 1,
++    ) -> WebhookDeliveryRecord:
++        record = WebhookDeliveryRecord(
++            id=str(uuid4()),
++            endpoint_id=endpoint_id,
++            workspace_id=workspace_id,
++            event=event,
++            payload=payload,
++            status=status,
++            attempts=attempts,
++            reason=reason,
++        )
++        self._deliveries[delivery_key] = record
++        return record
++
++    def _rejection_reason(
++        self,
++        endpoint: Optional[WebhookEndpoint],
++        workspace_id: str,
++        endpoint_version: Optional[int],
++    ) -> Optional[str]:
++        if endpoint is None:
++            return "endpoint_not_found"
++        if endpoint.workspace_id != workspace_id:
++            return "workspace_mismatch"
++        if not endpoint.enabled:
++            return "endpoint_disabled"
++        if endpoint_version is not None and endpoint.version != endpoint_version:
++            return "endpoint_rotated"
++        return None
++
++    def _shape_public_payload(self, value: Any) -> Any:
++        if isinstance(value, dict):
++            shaped = {}
++            for key, item in value.items():
++                normalized = str(key).lower()
++                if (
++                    normalized.startswith(INTERNAL_FIELD_PREFIXES)
++                    or normalized in INTERNAL_FIELD_NAMES
++                ):
++                    continue
++                shaped[key] = self._shape_public_payload(item)
++            return shaped
++        if isinstance(value, list):
++            return [self._shape_public_payload(item) for item in value]
++        return value
++
++    def _require_endpoint(self, endpoint_id: str) -> WebhookEndpoint:
++        endpoint = self._endpoints.get(endpoint_id)
++        if not endpoint:
++            raise KeyError(f"webhook endpoint {endpoint_id} not found")
++        return endpoint
++
++    def _validate_workspace(self, workspace_id: str) -> None:
++        if not workspace_id:
++            raise ValueError("workspace_id is required")
++
++    def _validate_url(self, url: str) -> None:
++        parsed = urlparse(url)
++        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
++            raise ValueError("webhook endpoint URL must be http or https")
+diff --git a/tests/test_webhook_delivery.py b/tests/test_webhook_delivery.py
+new file mode 100644
+index 00000000..529142f5
+--- /dev/null
++++ b/tests/test_webhook_delivery.py
+@@ -0,0 +1,167 @@
++import pytest
++
++from src.orchestrator.webhooks import WebhookDeliveryService
++
++
++def test_valid_delivery_filters_internal_run_metadata():
++    service = WebhookDeliveryService()
++    endpoint = service.register_endpoint(
++        "workspace-a",
++        "https://hooks.example.com/agent-events",
++        secret="secret-v1",
++    )
++
++    record = service.deliver(
++        endpoint.id,
++        "workspace-a",
++        "run.completed",
++        {
++            "run_id": "run-1",
++            "status": "completed",
++            "internal_trace_id": "trace-private",
++            "_debug": {"worker": "worker-1"},
++            "metadata": {
++                "visible": "yes",
++                "internal_queue": "q-private",
++                "_worker": "worker-1",
++            },
++        },
++        idempotency_key="evt-1",
++    )
++
++    assert record.status == "delivered"
++    assert record.payload == {
++        "event": "run.completed",
++        "workspace_id": "workspace-a",
++        "data": {
++            "run_id": "run-1",
++            "status": "completed",
++            "metadata": {"visible": "yes"},
++        },
++    }
++
++
++def test_endpoint_url_is_validated_before_persistence():
++    service = WebhookDeliveryService()
++
++    with pytest.raises(ValueError, match="http"):
++        service.register_endpoint("workspace-a", "file:///tmp/hook", secret="secret-v1")
++
++    assert service.endpoints("workspace-a") == []
++
++
++def test_rejects_disabled_and_cross_workspace_delivery():
++    service = WebhookDeliveryService()
++    endpoint = service.register_endpoint("workspace-a", "https://hooks.example.com/a", secret="v1")
++
++    cross_workspace = service.deliver(
++        endpoint.id,
++        "workspace-b",
++        "run.completed",
++        {"status": "completed", "internal_worker": "worker-1"},
++        idempotency_key="cross",
++    )
++    assert cross_workspace.status == "rejected"
++    assert cross_workspace.reason == "workspace_mismatch"
++    assert cross_workspace.payload == {}
++
++    service.disable_endpoint(endpoint.id)
++    disabled = service.deliver(
++        endpoint.id,
++        "workspace-a",
++        "run.completed",
++        {"status": "completed", "internal_worker": "worker-1"},
++        idempotency_key="disabled",
++    )
++    assert disabled.status == "rejected"
++    assert disabled.reason == "endpoint_disabled"
++    assert disabled.payload == {}
++
++
++def test_delivery_records_and_callbacks_are_idempotent_for_retries():
++    service = WebhookDeliveryService()
++    endpoint = service.register_endpoint("workspace-a", "https://hooks.example.com/a", secret="v1")
++    callbacks = []
++    sender_calls = []
++    service.register_callback("run.failed", callbacks.append)
++
++    first = service.deliver(
++        endpoint.id,
++        "workspace-a",
++        "run.failed",
++        {"status": "failed", "internal_error_id": "err-private"},
++        idempotency_key="evt-2",
++        sender=lambda endpoint, payload: sender_calls.append((endpoint.id, payload)) or 204,
++    )
++    replay = service.deliver(
++        endpoint.id,
++        "workspace-a",
++        "run.failed",
++        {"status": "failed", "internal_error_id": "err-private"},
++        idempotency_key="evt-2",
++        sender=lambda endpoint, payload: sender_calls.append((endpoint.id, payload)) or 204,
++    )
++
++    assert replay is first
++    assert first.attempts == 1
++    assert callbacks == [first]
++    assert len(sender_calls) == 1
++
++
++def test_failed_delivery_retries_with_same_public_payload():
++    service = WebhookDeliveryService()
++    endpoint = service.register_endpoint("workspace-a", "https://hooks.example.com/a", secret="v1")
++    callbacks = []
++    sender_payloads = []
++    service.register_callback("run.failed", callbacks.append)
++
++    def sender(_endpoint, payload):
++        sender_payloads.append(payload)
++        if len(sender_payloads) == 1:
++            raise TimeoutError("temporary timeout")
++        return 202
++
++    failed = service.deliver(
++        endpoint.id,
++        "workspace-a",
++        "run.failed",
++        {"status": "failed", "internal_error_id": "err-private"},
++        idempotency_key="evt-2",
++        sender=sender,
++    )
++    retried = service.deliver(
++        endpoint.id,
++        "workspace-a",
++        "run.failed",
++        {"status": "failed", "internal_error_id": "changed-private"},
++        idempotency_key="evt-2",
++        sender=sender,
++    )
++
++    assert failed.status == "failed"
++    assert failed.reason == "TimeoutError"
++    assert retried.status == "delivered"
++    assert retried.attempts == 2
++    assert sender_payloads == [retried.payload, retried.payload]
++    assert callbacks == [retried]
++
++
++def test_rotated_endpoint_rejects_stale_delivery_version():
++    service = WebhookDeliveryService()
++    endpoint = service.register_endpoint("workspace-a", "https://hooks.example.com/a", secret="v1")
++
++    rotated = service.rotate_endpoint(endpoint.id, secret="v2")
++    assert rotated.version == 2
++
++    stale = service.deliver(
++        endpoint.id,
++        "workspace-a",
++        "run.failed",
++        {"status": "failed", "internal_error_id": "err-private"},
++        idempotency_key="evt-3",
++        endpoint_version=1,
++    )
++
++    assert stale.status == "rejected"
++    assert stale.reason == "endpoint_rotated"
++    assert stale.payload == {}

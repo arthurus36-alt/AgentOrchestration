@@ -1,0 +1,143 @@
+From 2a7857e34e65395faabedf011ebfe90e26829b73 Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 04:08:09 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#31:=20Pin=20resolved=20handler=20per=20a?=
+ =?UTF-8?q?ttempt=20=E2=80=94=20mid-run=20registry=20updates?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/agent/registry.py             | 39 +++++++++++++++++++++++++++++++
+ tests/test_registry_resolution.py | 37 +++++++++++++++++++++++++++++
+ 2 files changed, 76 insertions(+)
+ create mode 100644 tests/test_registry_resolution.py
+
+diff --git a/src/agent/registry.py b/src/agent/registry.py
+index fbedbe1..56d70b4 100644
+--- a/src/agent/registry.py
++++ b/src/agent/registry.py
+@@ -6,6 +6,8 @@ import uuid
+ from enum import Enum
+ from typing import Any, Dict, List, Optional
+ 
++class ResolutionError(Exception):
++    pass
+ 
+ class AgentStatus(Enum):
+     PENDING = "pending"
+@@ -21,8 +23,23 @@ class AgentRegistry:
+         self.storage_backend = storage_backend
+         self._agents: Dict[str, Dict[str, Any]] = {}
+         self._index: Dict[str, List[str]] = {}
++        self._version: int = 1
++        self._pinned_handlers: Dict[str, int] = {}
++        self._audit_records: List[Dict[str, Any]] = []
++
++    def _record_audit(self, event: str, agent_id: str, reason: str = "") -> None:
++        self._audit_records.append({
++            "event": event,
++            "agent_id": agent_id,
++            "reason": reason,
++            "timestamp": time.time(),
++        })
++
++    def audit_records(self) -> List[Dict[str, Any]]:
++        return list(self._audit_records)
+ 
+     def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
++        self._version += 1
+         agent_id = str(uuid.uuid4())
+         timestamp = time.time()
+         self._agents[agent_id] = {
+@@ -34,6 +51,7 @@ class AgentRegistry:
+             "created_at": timestamp,
+             "updated_at": timestamp,
+             "version": "1.0.0",
++            "registry_version": self._version,
+             "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
+         }
+         group = agent_type.split(".")[0]
+@@ -45,6 +63,25 @@ class AgentRegistry:
+     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
+         return self._agents.get(agent_id)
+ 
++    def resolve(self, agent_id: str, attempt: str) -> Dict[str, Any]:
++        agent = self.get(agent_id)
++        if not agent:
++            self._record_audit("resolution_rejected", agent_id, "agent_not_found")
++            raise ResolutionError(f"Agent {agent_id} not found")
++            
++        pin_key = f"{agent_id}::{attempt}"
++        pinned_version = self._pinned_handlers.get(pin_key)
++
++        if pinned_version is not None:
++            if pinned_version != agent.get("registry_version"):
++                self._record_audit("resolution_rejected", agent_id, "stale_registry_version")
++                raise ResolutionError(f"Agent {agent_id} registry version changed during attempt")
++        else:
++            self._pinned_handlers[pin_key] = agent.get("registry_version")
++            self._record_audit("handler_pinned", agent_id, f"attempt_{attempt}")
++
++        return dict(agent)
++
+     def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+         agents = self._agents.values()
+         if status:
+@@ -57,8 +94,10 @@ class AgentRegistry:
+     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
+         if agent_id not in self._agents:
+             return False
++        self._version += 1
+         self._agents[agent_id]["status"] = status.value
+         self._agents[agent_id]["updated_at"] = time.time()
++        self._agents[agent_id]["registry_version"] = self._version
+         return True
+ 
+     def delete(self, agent_id: str) -> bool:
+diff --git a/tests/test_registry_resolution.py b/tests/test_registry_resolution.py
+new file mode 100644
+index 0000000..3aea0be
+--- /dev/null
++++ b/tests/test_registry_resolution.py
+@@ -0,0 +1,37 @@
++import pytest
++from src.agent.registry import AgentRegistry, AgentStatus, ResolutionError
++
++class TestAgentRegistryResolution:
++    def setup_method(self):
++        self.registry = AgentRegistry()
++
++    def test_resolve_pins_handler_version(self):
++        agent_id = self.registry.register("test-agent", "worker.processor")
++        
++        # Initial resolution pins the version
++        resolved = self.registry.resolve(agent_id, attempt="run-1")
++        assert resolved["name"] == "test-agent"
++        
++        # Updating status bumps the registry version
++        self.registry.update_status(agent_id, AgentStatus.RUNNING)
++        
++        # Subsequent resolution with same attempt id should fail due to stale version
++        with pytest.raises(ResolutionError, match="registry version changed"):
++            self.registry.resolve(agent_id, attempt="run-1")
++            
++        audit = self.registry.audit_records()
++        assert audit[-1]["event"] == "resolution_rejected"
++        assert audit[-1]["reason"] == "stale_registry_version"
++
++    def test_resolve_new_attempt_succeeds(self):
++        agent_id = self.registry.register("test-agent", "worker.processor")
++        
++        # Attempt 1
++        self.registry.resolve(agent_id, attempt="run-1")
++        
++        # Update agent version
++        self.registry.update_status(agent_id, AgentStatus.RUNNING)
++        
++        # Attempt 2 should succeed and pin new version
++        resolved = self.registry.resolve(agent_id, attempt="run-2")
++        assert resolved["status"] == "running"
+-- 
+2.47.3
+

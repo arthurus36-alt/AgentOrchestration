@@ -1,0 +1,117 @@
+From 8b61e302d8594da1ddb0a45f5eb158bb006701d6 Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 03:17:16 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#195:=20Apply=20rate=20limits=20before=20?=
+ =?UTF-8?q?expensive=20body=20parsing=20=E2=80=94=20ingress=20middleware?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/api/middleware.py            | 19 +++++++++++++++++++
+ src/api/server.py                |  5 +++--
+ tests/test_middleware_ingress.py | 25 +++++++++++++++++++++++++
+ 3 files changed, 47 insertions(+), 2 deletions(-)
+ create mode 100644 tests/test_middleware_ingress.py
+
+diff --git a/src/api/middleware.py b/src/api/middleware.py
+index c200929..08890d6 100644
+--- a/src/api/middleware.py
++++ b/src/api/middleware.py
+@@ -2,6 +2,7 @@
+ 
+ import time
+ import logging
++import asyncio
+ from typing import Callable
+ from starlette.middleware.base import BaseHTTPMiddleware
+ from starlette.requests import Request
+@@ -12,6 +13,9 @@ logger = logging.getLogger(__name__)
+ 
+ class AuthMiddleware(BaseHTTPMiddleware):
+     async def dispatch(self, request: Request, call_next: Callable) -> Response:
++        if request.method == "OPTIONS":
++            return await call_next(request)
++
+         if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+             token = request.headers.get("Authorization", "")
+             if not token.startswith("Bearer "):
+@@ -42,6 +46,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
+         return await call_next(request)
+ 
+ 
++class IngressMiddleware(BaseHTTPMiddleware):
++    async def dispatch(self, request: Request, call_next: Callable) -> Response:
++        # Prevent expensive body parsing before rate limits by rejecting oversized payloads early
++        content_length = request.headers.get("Content-Length")
++        if content_length and int(content_length) > 10 * 1024 * 1024:
++            return Response(status_code=413, content="Payload Too Large")
++            
++        try:
++            response = await call_next(request)
++            return response
++        finally:
++            # Clear local state if any was accumulated
++            pass
++
++
+ class LoggingMiddleware(BaseHTTPMiddleware):
+     async def dispatch(self, request: Request, call_next: Callable) -> Response:
+         start = time.time()
+diff --git a/src/api/server.py b/src/api/server.py
+index c6ae4bf..d6fbf52 100644
+--- a/src/api/server.py
++++ b/src/api/server.py
+@@ -8,8 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.middleware.trustedhost import TrustedHostMiddleware
+ 
+ from .routes import router
+-from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware
+-
++from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware, IngressMiddleware
+ 
+ def create_app(config: Dict = None) -> FastAPI:
+     app = FastAPI(
+@@ -30,6 +29,8 @@ def create_app(config: Dict = None) -> FastAPI:
+ 
+     app.add_middleware(TrustedHostMiddleware, allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","))
+ 
++    # Add IngressMiddleware before Auth/RateLimit so it guards body parsing
++    app.add_middleware(IngressMiddleware)
+     app.add_middleware(AuthMiddleware)
+     app.add_middleware(RateLimitMiddleware)
+     app.add_middleware(LoggingMiddleware)
+diff --git a/tests/test_middleware_ingress.py b/tests/test_middleware_ingress.py
+new file mode 100644
+index 0000000..914c59e
+--- /dev/null
++++ b/tests/test_middleware_ingress.py
+@@ -0,0 +1,25 @@
++import pytest
++from fastapi.testclient import TestClient
++from fastapi import FastAPI
++from src.api.middleware import IngressMiddleware
++from starlette.responses import JSONResponse
++
++app = FastAPI()
++app.add_middleware(IngressMiddleware)
++
++@app.post("/test")
++async def dummy_endpoint():
++    return JSONResponse({"status": "ok"})
++
++client = TestClient(app)
++
++def test_ingress_middleware_rejects_large_payload():
++    large_payload = b"x" * (11 * 1024 * 1024)
++    response = client.post("/test", content=large_payload, headers={"Content-Length": str(len(large_payload))})
++    assert response.status_code == 413
++    assert response.text == "Payload Too Large"
++
++def test_ingress_middleware_accepts_normal_payload():
++    response = client.post("/test", json={"data": "normal"})
++    assert response.status_code == 200
++    assert response.json() == {"status": "ok"}
+-- 
+2.47.3
+

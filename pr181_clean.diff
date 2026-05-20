@@ -1,0 +1,328 @@
+From eab554e293d6b6fda95369a70c20d7a01f413c2d Mon Sep 17 00:00:00 2001
+From: neumattock <152253273+newmattock@users.noreply.github.com>
+Date: Tue, 19 May 2026 19:41:02 -0700
+Subject: [PATCH] fix: honor scheduler blackout windows
+
+---
+ src/agent/__init__.py         |  10 +-
+ src/common/metrics.py         |  12 ++-
+ src/orchestrator/scheduler.py | 171 ++++++++++++++++++++++++++++++----
+ tests/test_metrics.py         |   1 -
+ tests/test_scheduler.py       |  72 +++++++++++++-
+ 5 files changed, 240 insertions(+), 26 deletions(-)
+
+diff --git a/src/orchestrator/scheduler.py b/src/orchestrator/scheduler.py
+index db2f3606..54ac2647 100644
+--- a/src/orchestrator/scheduler.py
++++ b/src/orchestrator/scheduler.py
+@@ -1,9 +1,8 @@
+ """Task Scheduler — Priority-based task queuing and dispatch."""
+ 
+-import asyncio
+ import heapq
+ import time
+-from typing import Any, Dict, Optional
++from typing import Any, Callable, Dict, List, Optional, Tuple
+ from uuid import uuid4
+ 
+ 
+@@ -31,44 +30,178 @@ def __len__(self) -> int:
+ 
+ 
+ class TaskScheduler:
+-    def __init__(self):
++    def __init__(self, time_fn: Optional[Callable[[], float]] = None):
++        self._time_fn = time_fn or time.time
+         self._queues: Dict[str, PriorityQueue] = {}
+-        self._scheduled: Dict[str, float] = {}
++        self._scheduled: Dict[str, Dict[str, Any]] = {}
+         self._in_flight: Dict[str, Dict] = {}
++        self._audit_records: List[Dict[str, Any]] = []
++        self._dispatch_metrics: Dict[str, int] = {
++            "blackout_deferrals": 0,
++        }
+         self._max_retries = 3
+ 
+-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
++    def enqueue(
++        self,
++        task: Dict,
++        queue: str = "default",
++        priority: int = 0,
++    ) -> str:
+         task_id = str(uuid4())
+         task["id"] = task_id
+-        task["enqueued_at"] = time.time()
++        task["enqueued_at"] = self._time_fn()
+         task["retries"] = 0
++        task["priority"] = priority
++
++        self._queue_task(task, queue, priority)
++        return task_id
+ 
++    def _queue_task(self, task: Dict, queue: str, priority: int) -> None:
+         if queue not in self._queues:
+             self._queues[queue] = PriorityQueue()
+         self._queues[queue].push(task, priority)
+-        return task_id
+ 
+-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
++    def schedule(
++        self,
++        task: Dict,
++        delay: float,
++        queue: str = "default",
++        priority: int = 0,
++    ) -> str:
+         task_id = str(uuid4())
+         task["id"] = task_id
+-        self._scheduled[task_id] = time.time() + delay
++        task["enqueued_at"] = self._time_fn()
++        task["retries"] = 0
++        task["priority"] = priority
++        self._scheduled[task_id] = {
++            "task": task,
++            "ready_at": self._time_fn() + delay,
++            "queue": queue,
++            "priority": priority,
++        }
+         return task_id
+ 
+-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+-        now = time.time()
+-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+-        for tid in expired:
+-            task = self._scheduled.pop(tid)
+-            if task:
+-                self.enqueue(task, queue)
++    async def dequeue(
++        self,
++        queue: str = "default",
++        timeout: float = 1.0,
++    ) -> Optional[Dict]:
++        now = self._time_fn()
++        self._promote_ready_scheduled(queue, now)
+ 
+         if queue in self._queues and len(self._queues[queue]) > 0:
+-            task = self._queues[queue].pop()
+-            if task:
++            deferred: List[Dict] = []
++            while len(self._queues[queue]) > 0:
++                task = self._queues[queue].pop()
++                if not task:
++                    continue
++                blackout = self._active_blackout(task, now)
++                if blackout:
++                    self._record_blackout(task, queue, blackout)
++                    deferred.append(task)
++                    continue
++
++                for deferred_task in deferred:
++                    self._queue_task(
++                        deferred_task,
++                        queue,
++                        deferred_task.get("priority", 0),
++                    )
+                 self._in_flight[task["id"]] = task
+                 return task
++
++            for deferred_task in deferred:
++                self._queue_task(
++                    deferred_task,
++                    queue,
++                    deferred_task.get("priority", 0),
++                )
++        return None
++
++    def _promote_ready_scheduled(self, queue: str, now: float) -> None:
++        ready_ids = [
++            task_id
++            for task_id, entry in self._scheduled.items()
++            if entry["queue"] == queue and entry["ready_at"] <= now
++        ]
++        for task_id in ready_ids:
++            entry = self._scheduled[task_id]
++            task = entry["task"]
++            blackout = self._active_blackout(task, now)
++            if blackout:
++                self._record_blackout(task, queue, blackout)
++                entry["ready_at"] = blackout[1]
++                continue
++            self._scheduled.pop(task_id, None)
++            self._queue_task(task, queue, entry["priority"])
++
++    def _active_blackout(
++        self,
++        task: Dict,
++        now: float,
++    ) -> Optional[Tuple[float, float]]:
++        for start, end in self._blackout_windows(task):
++            if start <= now < end:
++                return start, end
+         return None
+ 
++    def _blackout_windows(self, task: Dict) -> List[Tuple[float, float]]:
++        policy = task.get("dispatch_policy") or {}
++        workflow = task.get("workflow") or {}
++        workflow_policy = workflow.get("dispatch_policy") or {}
++        candidates = (
++            workflow_policy.get("blackout_windows")
++            or workflow.get("blackout_windows")
++            or policy.get("blackout_windows")
++            or task.get("blackout_windows")
++            or []
++        )
++        windows: List[Tuple[float, float]] = []
++        for candidate in candidates:
++            if isinstance(candidate, dict):
++                start = self._float_or_none(candidate.get("start"))
++                end = self._float_or_none(candidate.get("end"))
++            elif isinstance(candidate, (list, tuple)) and len(candidate) == 2:
++                start = self._float_or_none(candidate[0])
++                end = self._float_or_none(candidate[1])
++            else:
++                continue
++            if start is not None and end is not None and start < end:
++                windows.append((start, end))
++        return windows
++
++    def _float_or_none(self, value: Any) -> Optional[float]:
++        try:
++            return float(value)
++        except (TypeError, ValueError):
++            return None
++
++    def _record_blackout(
++        self,
++        task: Dict,
++        queue: str,
++        blackout: Tuple[float, float],
++    ) -> None:
++        self._dispatch_metrics["blackout_deferrals"] += 1
++        self._audit_records.append(
++            {
++                "event": "dispatch_deferred_blackout",
++                "task_id": task.get("id"),
++                "queue": queue,
++                "window_start": blackout[0],
++                "window_end": blackout[1],
++                "reason": "workflow_blackout_window",
++            }
++        )
++
++    @property
++    def audit_records(self) -> List[Dict[str, Any]]:
++        return list(self._audit_records)
++
++    @property
++    def dispatch_metrics(self) -> Dict[str, int]:
++        return dict(self._dispatch_metrics)
++
+     def complete(self, task_id: str) -> bool:
+         return self._in_flight.pop(task_id, None) is not None
+ 
+@@ -77,7 +210,7 @@ def fail(self, task_id: str, queue: str = "default") -> bool:
+         if task:
+             task["retries"] += 1
+             if task["retries"] < self._max_retries:
+-                self.enqueue(task, queue, priority=task.get("priority", 0))
++                self._queue_task(task, queue, priority=task.get("priority", 0))
+                 return True
+         return False
+ 
+diff --git a/tests/test_metrics.py b/tests/test_metrics.py
+index 383e5fc4..e73dffef 100644
+--- a/tests/test_metrics.py
++++ b/tests/test_metrics.py
+@@ -1,4 +1,3 @@
+-import pytest
+ from src.common.metrics import MetricsCollector
+ 
+ 
+diff --git a/tests/test_scheduler.py b/tests/test_scheduler.py
+index 538d23b8..ed20f9f0 100644
+--- a/tests/test_scheduler.py
++++ b/tests/test_scheduler.py
+@@ -1,4 +1,3 @@
+-import pytest
+ from src.orchestrator.scheduler import TaskScheduler
+ 
+ 
+@@ -36,6 +35,77 @@ def test_fail_task_with_retry(self):
+         task = asyncio.run(self.scheduler.dequeue())
+         assert self.scheduler.fail(task["id"])
+ 
++    def test_dequeue_defers_workflow_during_blackout_window(self):
++        now = 100.0
++        scheduler = TaskScheduler(time_fn=lambda: now)
++        task_id = scheduler.enqueue(
++            {
++                "type": "dispatch",
++                "payload": {"secret": "not-for-audit"},
++                "workflow": {
++                    "dispatch_policy": {
++                        "blackout_windows": [{"start": 90, "end": 120}],
++                    },
++                },
++            },
++            priority=10,
++        )
++
++        import asyncio
++        assert asyncio.run(scheduler.dequeue()) is None
++        assert scheduler.dispatch_metrics["blackout_deferrals"] == 1
++        assert scheduler.audit_records == [
++            {
++                "event": "dispatch_deferred_blackout",
++                "task_id": task_id,
++                "queue": "default",
++                "window_start": 90.0,
++                "window_end": 120.0,
++                "reason": "workflow_blackout_window",
++            }
++        ]
++        assert "secret" not in str(scheduler.audit_records)
++
++    def test_dequeue_dispatches_after_blackout_window(self):
++        current_time = {"value": 100.0}
++        scheduler = TaskScheduler(time_fn=lambda: current_time["value"])
++        task_id = scheduler.enqueue(
++            {
++                "type": "dispatch",
++                "workflow": {"blackout_windows": [{"start": 90, "end": 120}]},
++            }
++        )
++
++        import asyncio
++        assert asyncio.run(scheduler.dequeue()) is None
++        current_time["value"] = 121.0
++        task = asyncio.run(scheduler.dequeue())
++
++        assert task is not None
++        assert task["id"] == task_id
++        assert task["type"] == "dispatch"
++
++    def test_scheduled_task_waits_until_blackout_window_expires(self):
++        current_time = {"value": 100.0}
++        scheduler = TaskScheduler(time_fn=lambda: current_time["value"])
++        task_id = scheduler.schedule(
++            {
++                "type": "scheduled-dispatch",
++                "dispatch_policy": {"blackout_windows": [(90, 120)]},
++            },
++            delay=0,
++        )
++
++        import asyncio
++        assert asyncio.run(scheduler.dequeue()) is None
++        assert scheduler.dispatch_metrics["blackout_deferrals"] == 1
++        current_time["value"] = 120.0
++        task = asyncio.run(scheduler.dequeue())
++
++        assert task is not None
++        assert task["id"] == task_id
++        assert task["type"] == "scheduled-dispatch"
++
+ # 2019-01-09T19:07:03 update
+ 
+ # 2019-02-18T12:30:02 update

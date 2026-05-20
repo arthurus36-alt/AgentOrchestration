@@ -1,0 +1,385 @@
+diff --git a/src/orchestrator/scheduler.py b/src/orchestrator/scheduler.py
+index db2f3606..f02307b6 100644
+--- a/src/orchestrator/scheduler.py
++++ b/src/orchestrator/scheduler.py
+@@ -1,9 +1,8 @@
+ """Task Scheduler — Priority-based task queuing and dispatch."""
+ 
+-import asyncio
+ import heapq
+ import time
+-from typing import Any, Dict, Optional
++from typing import Any, Dict, List, Optional, Set
+ from uuid import uuid4
+ 
+ 
+@@ -33,52 +32,257 @@ def __len__(self) -> int:
+ class TaskScheduler:
+     def __init__(self):
+         self._queues: Dict[str, PriorityQueue] = {}
+-        self._scheduled: Dict[str, float] = {}
++        self._scheduled: Dict[str, Dict[str, Any]] = {}
++        self._queued_task_ids: Set[str] = set()
+         self._in_flight: Dict[str, Dict] = {}
++        self._audit_records: List[Dict[str, Any]] = []
+         self._max_retries = 3
+ 
+-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+-        task_id = str(uuid4())
+-        task["id"] = task_id
++    def _audit(
++        self,
++        action: str,
++        task_id: str,
++        decision: str,
++        reason: str,
++        queue: str = "default",
++        revision: int = 0,
++    ) -> None:
++        self._audit_records.append({
++            "action": action,
++            "task_id": task_id,
++            "decision": decision,
++            "reason": reason,
++            "queue": queue,
++            "revision": revision,
++            "timestamp": time.time(),
++        })
++
++    def audit_records(self) -> List[Dict[str, Any]]:
++        return list(self._audit_records)
++
++    def _active_lifecycle(self, task_id: str) -> Optional[str]:
++        if task_id in self._in_flight:
++            return "in_flight"
++        if task_id in self._queued_task_ids:
++            return "queued"
++        if task_id in self._scheduled:
++            return "scheduled"
++        return None
++
++    def _queue_task(
++        self,
++        task: Dict,
++        queue: str,
++        priority: int,
++        action: str = "enqueue",
++    ) -> bool:
++        task_id = task["id"]
++        lifecycle = self._active_lifecycle(task_id)
++        if lifecycle:
++            self._audit(action, task_id, "reject", lifecycle, queue)
++            return False
++
++        task["queue"] = queue
++        task["priority"] = priority
++        task["lifecycle"] = "queued"
+         task["enqueued_at"] = time.time()
+-        task["retries"] = 0
+ 
+         if queue not in self._queues:
+             self._queues[queue] = PriorityQueue()
+         self._queues[queue].push(task, priority)
++        self._queued_task_ids.add(task_id)
++        self._audit(
++            action,
++            task_id,
++            "accept",
++            "queued",
++            queue,
++            task.get("schedule_revision", 0),
++        )
++        return True
++
++    def enqueue(
++        self,
++        task: Dict,
++        queue: str = "default",
++        priority: int = 0,
++    ) -> str:
++        task_id = task.get("id") or str(uuid4())
++        task["id"] = task_id
++        task.setdefault("retries", 0)
++        self._queue_task(task, queue, priority)
+         return task_id
+ 
+-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+-        task_id = str(uuid4())
++    def schedule(
++        self,
++        task: Dict,
++        delay: float,
++        queue: str = "default",
++        priority: int = 0,
++    ) -> str:
++        task_id = task.get("id") or str(uuid4())
+         task["id"] = task_id
+-        self._scheduled[task_id] = time.time() + delay
++        task.setdefault("retries", 0)
++
++        lifecycle = self._active_lifecycle(task_id)
++        if lifecycle:
++            self._audit("schedule", task_id, "reject", lifecycle, queue)
++            return task_id
++
++        revision = task.get("schedule_revision", 0) + 1
++        task["schedule_revision"] = revision
++        task["lifecycle"] = "scheduled"
++        task["queue"] = queue
++        task["priority"] = priority
++        self._scheduled[task_id] = {
++            "task": task,
++            "run_at": time.time() + delay,
++            "queue": queue,
++            "priority": priority,
++            "revision": revision,
++        }
++        self._audit(
++            "schedule",
++            task_id,
++            "accept",
++            "scheduled",
++            queue,
++            revision,
++        )
+         return task_id
+ 
+-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
++    def reschedule(
++        self,
++        task_id: str,
++        delay: float,
++        queue: Optional[str] = None,
++        priority: Optional[int] = None,
++        expected_revision: Optional[int] = None,
++    ) -> bool:
++        entry = self._scheduled.get(task_id)
++        if entry is None:
++            self._audit(
++                "reschedule",
++                task_id,
++                "reject",
++                "task_not_scheduled",
++                queue or "default",
++            )
++            return False
++
++        if (
++            expected_revision is not None
++            and entry["revision"] != expected_revision
++        ):
++            self._audit(
++                "reschedule",
++                task_id,
++                "reject",
++                "stale_revision",
++                queue or entry["queue"],
++                entry["revision"],
++            )
++            return False
++
++        next_queue = queue or entry["queue"]
++        next_priority = entry["priority"] if priority is None else priority
++        revision = entry["revision"] + 1
++        entry.update({
++            "run_at": time.time() + delay,
++            "queue": next_queue,
++            "priority": next_priority,
++            "revision": revision,
++        })
++        entry["task"]["queue"] = next_queue
++        entry["task"]["priority"] = next_priority
++        entry["task"]["schedule_revision"] = revision
++        entry["task"]["lifecycle"] = "scheduled"
++        self._audit(
++            "reschedule",
++            task_id,
++            "accept",
++            "scheduled",
++            next_queue,
++            revision,
++        )
++        return True
++
++    async def dequeue(
++        self,
++        queue: str = "default",
++        timeout: float = 1.0,
++    ) -> Optional[Dict]:
+         now = time.time()
+-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
++        expired = [
++            tid
++            for tid, entry in self._scheduled.items()
++            if entry["run_at"] <= now and entry["queue"] == queue
++        ]
+         for tid in expired:
+-            task = self._scheduled.pop(tid)
+-            if task:
+-                self.enqueue(task, queue)
++            entry = self._scheduled.pop(tid, None)
++            if entry:
++                self._queue_task(
++                    entry["task"],
++                    entry["queue"],
++                    entry["priority"],
++                    action="delayed_enqueue",
++                )
+ 
+         if queue in self._queues and len(self._queues[queue]) > 0:
+             task = self._queues[queue].pop()
+             if task:
++                self._queued_task_ids.discard(task["id"])
++                task["lifecycle"] = "in_flight"
+                 self._in_flight[task["id"]] = task
++                self._audit(
++                    "dequeue",
++                    task["id"],
++                    "accept",
++                    "in_flight",
++                    queue,
++                    task.get("schedule_revision", 0),
++                )
+                 return task
+         return None
+ 
+     def complete(self, task_id: str) -> bool:
+-        return self._in_flight.pop(task_id, None) is not None
++        task = self._in_flight.pop(task_id, None)
++        if task is None:
++            self._audit("complete", task_id, "reject", "task_not_in_flight")
++            return False
++        task["lifecycle"] = "completed"
++        self._audit(
++            "complete",
++            task_id,
++            "accept",
++            "completed",
++            task.get("queue", "default"),
++            task.get("schedule_revision", 0),
++        )
++        return True
+ 
+     def fail(self, task_id: str, queue: str = "default") -> bool:
+         task = self._in_flight.pop(task_id, None)
+         if task:
+             task["retries"] += 1
+             if task["retries"] < self._max_retries:
+-                self.enqueue(task, queue, priority=task.get("priority", 0))
+-                return True
++                return self._queue_task(
++                    task,
++                    queue,
++                    task.get("priority", 0),
++                    action="retry_enqueue",
++                )
++            task["lifecycle"] = "failed"
++            self._audit(
++                "fail",
++                task_id,
++                "accept",
++                "retry_exhausted",
++                task.get("queue", queue),
++                task.get("schedule_revision", 0),
++            )
++            return False
++        self._audit("fail", task_id, "reject", "task_not_in_flight", queue)
+         return False
+ 
+ # 2019-04-25T08:37:12 update
+diff --git a/tests/test_scheduler.py b/tests/test_scheduler.py
+index 538d23b8..9ccb5d71 100644
+--- a/tests/test_scheduler.py
++++ b/tests/test_scheduler.py
+@@ -1,4 +1,5 @@
+-import pytest
++import asyncio
++
+ from src.orchestrator.scheduler import TaskScheduler
+ 
+ 
+@@ -12,7 +13,6 @@ def test_enqueue_task(self):
+ 
+     def test_dequeue_task(self):
+         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
+-        import asyncio
+         task = asyncio.run(self.scheduler.dequeue())
+         assert task is not None
+         assert task["type"] == "test"
+@@ -20,22 +20,73 @@ def test_dequeue_task(self):
+     def test_enqueue_multiple_priorities(self):
+         self.scheduler.enqueue({"type": "low"}, priority=1)
+         self.scheduler.enqueue({"type": "high"}, priority=10)
+-        import asyncio
+         task = asyncio.run(self.scheduler.dequeue())
+         assert task["type"] == "high"
+ 
+     def test_complete_task(self):
+         self.scheduler.enqueue({"type": "test"})
+-        import asyncio
+         task = asyncio.run(self.scheduler.dequeue())
+         assert self.scheduler.complete(task["id"])
+ 
+     def test_fail_task_with_retry(self):
+         self.scheduler.enqueue({"type": "test"})
+-        import asyncio
+         task = asyncio.run(self.scheduler.dequeue())
+         assert self.scheduler.fail(task["id"])
+ 
++    def test_due_scheduled_task_dequeues_with_original_id(self):
++        task_id = self.scheduler.schedule({"type": "delayed"}, delay=0)
++
++        task = asyncio.run(self.scheduler.dequeue())
++
++        assert task is not None
++        assert task["id"] == task_id
++        assert task["lifecycle"] == "in_flight"
++
++    def test_reschedule_in_flight_task_is_rejected_and_audited(self):
++        task_id = self.scheduler.schedule(
++            {
++                "type": "delayed",
++                "payload": {"secret": "private-runtime-data"},
++            },
++            delay=0,
++        )
++        task = asyncio.run(self.scheduler.dequeue())
++        assert task["id"] == task_id
++
++        assert self.scheduler.reschedule(task_id, delay=0) is False
++
++        assert task_id in self.scheduler._in_flight
++        audit_record = self.scheduler.audit_records()[-1]
++        assert audit_record["decision"] == "reject"
++        assert audit_record["task_id"] == task_id
++        assert audit_record["reason"] == "task_not_scheduled"
++        assert "private-runtime-data" not in repr(audit_record)
++
++    def test_reschedule_stale_revision_is_rejected(self):
++        task_id = self.scheduler.schedule(
++            {
++                "type": "delayed",
++                "payload": {"secret": "private-runtime-data"},
++            },
++            delay=30,
++        )
++        entry = self.scheduler._scheduled[task_id]
++        original_run_at = entry["run_at"]
++        original_revision = entry["revision"]
++
++        assert self.scheduler.reschedule(
++            task_id,
++            delay=0,
++            expected_revision=original_revision - 1,
++        ) is False
++
++        assert entry["run_at"] == original_run_at
++        assert entry["revision"] == original_revision
++        audit_record = self.scheduler.audit_records()[-1]
++        assert audit_record["decision"] == "reject"
++        assert audit_record["reason"] == "stale_revision"
++        assert "private-runtime-data" not in repr(audit_record)
++
+ # 2019-01-09T19:07:03 update
+ 
+ # 2019-02-18T12:30:02 update

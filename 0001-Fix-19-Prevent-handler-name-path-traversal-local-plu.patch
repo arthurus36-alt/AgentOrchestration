@@ -1,0 +1,141 @@
+From 64ccd9ec43ab88b4b521d807e5e7c6afdec11ec5 Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 04:28:45 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#19:=20Prevent=20handler=20name=20path=20?=
+ =?UTF-8?q?traversal=20=E2=80=94=20local=20plugin=20metadata?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/agent/registry.py            | 57 ++++++++++++++++++++++++++++++++
+ tests/test_registry_traversal.py | 26 +++++++++++++++
+ 2 files changed, 83 insertions(+)
+ create mode 100644 tests/test_registry_traversal.py
+
+diff --git a/src/agent/registry.py b/src/agent/registry.py
+index 56d70b4..7b9efd4 100644
+--- a/src/agent/registry.py
++++ b/src/agent/registry.py
+@@ -3,8 +3,10 @@
+ import json
+ import time
+ import uuid
++import os
+ from enum import Enum
+ from typing import Any, Dict, List, Optional
++from pathlib import Path
+ 
+ class ResolutionError(Exception):
+     pass
+@@ -17,6 +19,8 @@ class AgentStatus(Enum):
+     FAILED = "failed"
+     TERMINATED = "terminated"
+ 
++class RegistryError(Exception):
++    pass
+ 
+ class AgentRegistry:
+     def __init__(self, storage_backend: str = "memory"):
+@@ -26,6 +30,53 @@ class AgentRegistry:
+         self._version: int = 1
+         self._pinned_handlers: Dict[str, int] = {}
+         self._audit_records: List[Dict[str, Any]] = []
++        self.metadata_root = Path("/tmp/ao_metadata")
++        self.metadata_root.mkdir(parents=True, exist_ok=True)
++
++    def _validate_handler_name(self, name: str) -> None:
++        if ".." in name or "/" in name or "\\" in name:
++            raise RegistryError(f"Invalid handler name: path traversal attempt detected in '{name}'")
++            
++    def _build_artifact_path(self, agent_id: str, handler_name: str) -> Path:
++        self._validate_handler_name(handler_name)
++        
++        agent_dir = self.metadata_root / agent_id
++        agent_dir.mkdir(exist_ok=True)
++        
++        artifact_path = agent_dir / f"{handler_name}.json"
++        
++        try:
++            artifact_path.resolve().relative_to(self.metadata_root.resolve())
++        except ValueError:
++            raise RegistryError("Path traversal violation: constructed path escapes metadata root")
++            
++        return artifact_path
++
++    def save_plugin_metadata(self, agent_id: str, handler_name: str, data: Dict) -> bool:
++        if agent_id not in self._agents:
++            return False
++            
++        try:
++            path = self._build_artifact_path(agent_id, handler_name)
++            with open(path, "w") as f:
++                json.dump(data, f)
++            return True
++        except RegistryError:
++            raise
++
++    def load_plugin_metadata(self, agent_id: str, handler_name: str) -> Optional[Dict]:
++        if agent_id not in self._agents:
++            return None
++            
++        try:
++            path = self._build_artifact_path(agent_id, handler_name)
++            if not path.exists():
++                return None
++                
++            with open(path, "r") as f:
++                return json.load(f)
++        except RegistryError:
++            raise
+ 
+     def _record_audit(self, event: str, agent_id: str, reason: str = "") -> None:
+         self._audit_records.append({
+@@ -107,6 +158,12 @@ class AgentRegistry:
+         group = agent["type"].split(".")[0]
+         if group in self._index and agent_id in self._index[group]:
+             self._index[group].remove(agent_id)
++            
++        agent_dir = self.metadata_root / agent_id
++        if agent_dir.exists():
++            import shutil
++            shutil.rmtree(agent_dir, ignore_errors=True)
++            
+         return True
+ 
+     def count(self) -> int:
+diff --git a/tests/test_registry_traversal.py b/tests/test_registry_traversal.py
+new file mode 100644
+index 0000000..fbf2425
+--- /dev/null
++++ b/tests/test_registry_traversal.py
+@@ -0,0 +1,26 @@
++import pytest
++from src.agent.registry import AgentRegistry, RegistryError
++
++class TestRegistryPathTraversal:
++    def setup_method(self):
++        self.registry = AgentRegistry()
++        
++    def test_save_plugin_metadata_rejects_path_traversal(self):
++        agent_id = self.registry.register("test-agent", "worker")
++        
++        with pytest.raises(RegistryError, match="path traversal attempt"):
++            self.registry.save_plugin_metadata(agent_id, "../../../etc/passwd", {"malicious": True})
++
++    def test_save_plugin_metadata_rejects_absolute_path(self):
++        agent_id = self.registry.register("test-agent", "worker")
++        
++        with pytest.raises(RegistryError, match="path traversal attempt"):
++            self.registry.save_plugin_metadata(agent_id, "/etc/passwd", {"malicious": True})
++            
++    def test_valid_plugin_metadata_succeeds(self):
++        agent_id = self.registry.register("test-agent", "worker")
++        
++        assert self.registry.save_plugin_metadata(agent_id, "my_plugin", {"valid": True}) is True
++        
++        data = self.registry.load_plugin_metadata(agent_id, "my_plugin")
++        assert data == {"valid": True}
+-- 
+2.47.3
+

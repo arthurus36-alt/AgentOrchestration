@@ -1,0 +1,74 @@
+From 33b90638ca153207763773b49a0da884266e7140 Mon Sep 17 00:00:00 2001
+From: Bot <bot@example.com>
+Date: Tue, 19 May 2026 23:57:06 +0000
+Subject: [PATCH] Fix #88: Report JSON parse failures with path context
+
+---
+ src/common/config.py             | 15 +++++++++++++--
+ tests/test_config_json_errors.py | 13 +++++++++++++
+ 2 files changed, 26 insertions(+), 2 deletions(-)
+ create mode 100644 tests/test_config_json_errors.py
+
+diff --git a/src/common/config.py b/src/common/config.py
+index 07894d3..0b7b251 100644
+--- a/src/common/config.py
++++ b/src/common/config.py
+@@ -2,8 +2,10 @@
+ 
+ import os
+ import json
++from json import JSONDecodeError
+ from typing import Any, Dict, Optional
+ 
++from src.common.errors import ConfigurationError
+ 
+ class Config:
+     def __init__(self, config_path: Optional[str] = None):
+@@ -13,14 +15,23 @@ class Config:
+         self._load_env_overrides()
+ 
+     def load(self, path: str) -> None:
+-        with open(path) as f:
+-            self._data = json.load(f)
++        try:
++            with open(path) as f:
++                self._data = json.load(f)
++        except JSONDecodeError as exc:
++            raise ConfigurationError(
++                f"failed to parse JSON config file '{path}' at line {exc.lineno}, column {exc.colno}: {exc.msg}"
++            ) from exc
+ 
+     def _load_env_overrides(self) -> None:
+         prefix = "AO_"
++        mapped_keys = {}
+         for key, value in os.environ.items():
+             if key.startswith(prefix):
+                 config_key = key[len(prefix):].lower().replace("_", ".")
++                if config_key in mapped_keys:
++                    raise ValueError(f"Case collision detected for env overrides: '{mapped_keys[config_key]}' and '{key}' both map to '{config_key}'")
++                mapped_keys[config_key] = key
+                 self._set_nested(config_key, value)
+ 
+     def _set_nested(self, key: str, value: Any) -> None:
+diff --git a/tests/test_config_json_errors.py b/tests/test_config_json_errors.py
+new file mode 100644
+index 0000000..07e562a
+--- /dev/null
++++ b/tests/test_config_json_errors.py
+@@ -0,0 +1,13 @@
++import pytest
++from src.common.config import Config
++from src.common.errors import ConfigurationError
++
++def test_malformed_json_error_includes_path_line_and_column(tmp_path):
++    config_file = tmp_path / "broken.json"
++    config_file.write_text('{"app": {"name": "test",}\n')
++
++    with pytest.raises(ConfigurationError) as exc_info:
++        Config(str(config_file))
++
++    message = str(exc_info.value)
++    assert str(config_file) in message
+-- 
+2.47.3
+

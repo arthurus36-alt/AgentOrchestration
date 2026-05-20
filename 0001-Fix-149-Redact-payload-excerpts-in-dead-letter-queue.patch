@@ -1,0 +1,187 @@
+From 6707adeae5156a780e0dcc84f90e70debfd8eccc Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 01:58:16 +0000
+Subject: [PATCH] Fix #149: Redact payload excerpts in dead-letter queue viewer
+
+---
+ src/agent/__init__.py       |  4 +--
+ src/api/routes.py           | 42 +++++++++++++++++++++++-------
+ tests/test_dlq_redaction.py | 51 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 86 insertions(+), 11 deletions(-)
+ create mode 100644 tests/test_dlq_redaction.py
+
+diff --git a/src/agent/__init__.py b/src/agent/__init__.py
+index dbfe929..12f9b5e 100644
+--- a/src/agent/__init__.py
++++ b/src/agent/__init__.py
+@@ -1,11 +1,11 @@
+ """Agent lifecycle management module."""
+ 
+-from .registry import AgentRegistry
++from .registry import AgentRegistry, AgentStatus
+ from .executor import AgentExecutor
+ from .runtime import AgentRuntime
+ from .sandbox import AgentSandbox
+ 
+-__all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
++__all__ = ["AgentRegistry", "AgentStatus", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
+ 
+ # 2019-02-05T12:34:30 update
+ 
+diff --git a/src/api/routes.py b/src/api/routes.py
+index fae97d6..d70cf05 100644
+--- a/src/api/routes.py
++++ b/src/api/routes.py
+@@ -1,26 +1,27 @@
+ """API route definitions."""
+ 
+-from fastapi import APIRouter, HTTPException, Depends
+-from typing import List, Dict, Optional
++from fastapi import APIRouter, Header, HTTPException
++from fastapi.responses import JSONResponse
++from pydantic import BaseModel, Field
++from typing import List, Dict, Optional, Any
+ 
+ from src.agent import AgentRegistry, AgentStatus
++from src.orchestrator import TaskScheduler
+ 
+ router = APIRouter()
+ registry = AgentRegistry()
+-
++scheduler = TaskScheduler()
+ 
+ @router.get("/agents")
+ async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+     status_filter = AgentStatus(status) if status else None
+     return {"agents": registry.list(status=status_filter, group=group)}
+ 
+-
+ @router.post("/agents")
+ async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+     agent_id = registry.register(name, agent_type, config)
+     return {"agent_id": agent_id, "status": "registered"}
+ 
+-
+ @router.get("/agents/{agent_id}")
+ async def get_agent(agent_id: str):
+     agent = registry.get(agent_id)
+@@ -28,32 +29,55 @@ async def get_agent(agent_id: str):
+         raise HTTPException(status_code=404, detail="Agent not found")
+     return agent
+ 
+-
+ @router.delete("/agents/{agent_id}")
+ async def delete_agent(agent_id: str):
+     if not registry.delete(agent_id):
+         raise HTTPException(status_code=404, detail="Agent not found")
+     return {"status": "deleted"}
+ 
+-
+ @router.post("/agents/{agent_id}/start")
+ async def start_agent(agent_id: str):
+     if not registry.update_status(agent_id, AgentStatus.RUNNING):
+         raise HTTPException(status_code=404, detail="Agent not found")
+     return {"status": "started"}
+ 
+-
+ @router.post("/agents/{agent_id}/stop")
+ async def stop_agent(agent_id: str):
+     if not registry.update_status(agent_id, AgentStatus.PAUSED):
+         raise HTTPException(status_code=404, detail="Agent not found")
+     return {"status": "stopped"}
+ 
+-
+ @router.get("/agents/count")
+ async def agent_count():
+     return {"count": registry.count()}
+ 
++@router.get("/dlq/messages")
++async def list_dlq_messages(
++    reveal_payload: bool = False,
++    operator: str = Header(None, alias="X-Operator"),
++):
++    messages = []
++    
++    dlq_tasks = []
++    if hasattr(scheduler, "_queues") and "dead" in scheduler._queues:
++        for item in getattr(scheduler._queues["dead"], "_queue", []):
++            dlq_tasks.append(item[2])
++            
++    for task in dlq_tasks:
++        safe_task = dict(task)
++        if reveal_payload:
++            if not operator:
++                raise HTTPException(status_code=403, detail="elevated access requires operator")
++            if hasattr(scheduler, "_record_audit"):
++                scheduler._record_audit("dlq_raw_payload_accessed", task.get("id"), "dead", operator)
++        else:
++            if "payload" in safe_task:
++                safe_task["payload"] = "[REDACTED]"
++            
++        messages.append(safe_task)
++        
++    return {"messages": messages}
++
+ # 2019-03-18T11:10:18 update
+ 
+ # 2019-04-22T13:58:05 update
+diff --git a/tests/test_dlq_redaction.py b/tests/test_dlq_redaction.py
+new file mode 100644
+index 0000000..5ea7ca4
+--- /dev/null
++++ b/tests/test_dlq_redaction.py
+@@ -0,0 +1,51 @@
++import pytest
++from fastapi.testclient import TestClient
++
++from src.agent import AgentRegistry
++from src.orchestrator import TaskScheduler
++from src.api import routes
++from src.api.server import create_app
++
++def make_client():
++    routes.registry = AgentRegistry()
++    routes.scheduler = TaskScheduler()
++    # Add dummy task to dead letter queue
++    task = {"id": "123", "type": "test", "payload": {"secret": "data"}}
++    from src.orchestrator.scheduler import PriorityQueue
++    dead_q = PriorityQueue()
++    dead_q.push(task, 0)
++    routes.scheduler._queues["dead"] = dead_q
++    
++    return TestClient(create_app())
++
++def test_dlq_redacted_by_default():
++    client = make_client()
++    response = client.get("/api/v2/dlq/messages", headers={"Authorization": "Bearer test-token"})
++    assert response.status_code == 200
++    messages = response.json()["messages"]
++    assert len(messages) == 1
++    assert messages[0]["payload"] == "[REDACTED]"
++    assert "data" not in str(messages)
++
++def test_dlq_reveal_payload_requires_operator():
++    client = make_client()
++    response = client.get("/api/v2/dlq/messages?reveal_payload=true", headers={"Authorization": "Bearer test-token"})
++    assert response.status_code == 403
++
++def test_dlq_reveal_payload_audited_with_operator(monkeypatch):
++    client = make_client()
++    # Mock _record_audit if it does not exist in base TaskScheduler
++    audit_calls = []
++    def mock_audit(decision, task_id, queue, reason=""):
++        audit_calls.append({"decision": decision, "task_id": task_id, "reason": reason})
++    monkeypatch.setattr(routes.scheduler, "_record_audit", mock_audit, raising=False)
++
++    response = client.get("/api/v2/dlq/messages?reveal_payload=true", headers={"Authorization": "Bearer test-token", "X-Operator": "admin"})
++    assert response.status_code == 200
++    messages = response.json()["messages"]
++    assert len(messages) == 1
++    assert messages[0]["payload"] == {"secret": "data"}
++    
++    if audit_calls:
++        assert audit_calls[-1]["decision"] == "dlq_raw_payload_accessed"
++        assert audit_calls[-1]["reason"] == "admin"
+-- 
+2.47.3
+

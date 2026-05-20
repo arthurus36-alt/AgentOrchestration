@@ -1,0 +1,252 @@
+commit 7c132280254b7c5ca0884b7d3328ea5a814f1635
+Author: arthurus36-alt <arthurus36@gmail.com>
+Date:   Tue May 19 18:51:25 2026 +0000
+
+    fix: Prevent handler name path traversal (#19)
+
+diff --git a/src/agent/registry.py b/src/agent/registry.py
+index fbedbe1..bdd2029 100644
+--- a/src/agent/registry.py
++++ b/src/agent/registry.py
+@@ -3,8 +3,10 @@
+ import json
+ import time
+ import uuid
++import os
+ from enum import Enum
+ from typing import Any, Dict, List, Optional
++from pathlib import Path
+ 
+ 
+ class AgentStatus(Enum):
+@@ -16,11 +18,65 @@ class AgentStatus(Enum):
+     TERMINATED = "terminated"
+ 
+ 
++class RegistryError(Exception):
++    pass
++
++
+ class AgentRegistry:
+     def __init__(self, storage_backend: str = "memory"):
+         self.storage_backend = storage_backend
+         self._agents: Dict[str, Dict[str, Any]] = {}
+         self._index: Dict[str, List[str]] = {}
++        self.metadata_root = Path("/tmp/ao_metadata")
++        self.metadata_root.mkdir(parents=True, exist_ok=True)
++
++    # Fix for #19: Prevent handler name path traversal by sanitizing names before path construction
++    def _validate_handler_name(self, name: str) -> None:
++        if ".." in name or "/" in name or "\\" in name:
++            raise RegistryError(f"Invalid handler name: path traversal attempt detected in '{name}'")
++            
++    def _build_artifact_path(self, agent_id: str, handler_name: str) -> Path:
++        self._validate_handler_name(handler_name)
++        
++        agent_dir = self.metadata_root / agent_id
++        agent_dir.mkdir(exist_ok=True)
++        
++        # Safe construction
++        artifact_path = agent_dir / f"{handler_name}.json"
++        
++        # Verify it hasn't escaped the base directory as defense in depth
++        try:
++            artifact_path.resolve().relative_to(self.metadata_root.resolve())
++        except ValueError:
++            raise RegistryError("Path traversal violation: constructed path escapes metadata root")
++            
++        return artifact_path
++
++    def save_plugin_metadata(self, agent_id: str, handler_name: str, data: Dict) -> bool:
++        if agent_id not in self._agents:
++            return False
++            
++        try:
++            path = self._build_artifact_path(agent_id, handler_name)
++            with open(path, "w") as f:
++                json.dump(data, f)
++            return True
++        except RegistryError:
++            raise
++
++    def load_plugin_metadata(self, agent_id: str, handler_name: str) -> Optional[Dict]:
++        if agent_id not in self._agents:
++            return None
++            
++        try:
++            path = self._build_artifact_path(agent_id, handler_name)
++            if not path.exists():
++                return None
++                
++            with open(path, "r") as f:
++                return json.load(f)
++        except RegistryError:
++            raise
+ 
+     def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+         agent_id = str(uuid.uuid4())
+@@ -68,115 +124,14 @@ class AgentRegistry:
+         group = agent["type"].split(".")[0]
+         if group in self._index and agent_id in self._index[group]:
+             self._index[group].remove(agent_id)
++            
++        # Fix for #19: Clean up cached metadata paths when agent is deleted
++        agent_dir = self.metadata_root / agent_id
++        if agent_dir.exists():
++            import shutil
++            shutil.rmtree(agent_dir, ignore_errors=True)
++            
+         return True
+ 
+     def count(self) -> int:
+         return len(self._agents)
+-
+-# 2019-01-29T11:24:49 update
+-
+-# 2019-04-09T13:38:38 update
+-
+-# 2019-04-11T11:24:12 update
+-
+-# 2019-06-26T17:03:48 update
+-
+-# 2019-07-03T14:55:48 update
+-
+-# 2019-07-18T18:18:47 update
+-
+-# 2019-11-05T11:27:19 update
+-
+-# 2019-11-20T11:35:05 update
+-
+-# 2019-11-23T15:28:54 update
+-
+-# 2020-03-13T09:23:07 update
+-
+-# 2020-03-30T19:31:18 update
+-
+-# 2020-04-22T15:03:30 update
+-
+-# 2020-07-21T10:00:48 update
+-
+-# 2020-09-10T09:02:08 update
+-
+-# 2020-09-10T13:39:12 update
+-
+-# 2020-09-22T16:27:52 update
+-
+-# 2020-10-15T10:33:14 update
+-
+-# 2021-05-13T11:15:56 update
+-
+-# 2021-07-07T14:57:13 update
+-
+-# 2021-07-13T15:15:19 update
+-
+-# 2021-07-27T10:18:16 update
+-
+-# 2022-03-11T15:24:11 update
+-
+-# 2022-09-22T13:24:20 update
+-
+-# 2022-11-01T12:20:40 update
+-
+-# 2023-01-30T12:32:27 update
+-
+-# 2023-03-10T09:43:50 update
+-
+-# 2023-05-10T14:28:01 update
+-
+-# 2023-05-11T20:04:46 update
+-
+-# 2023-05-30T17:00:59 update
+-
+-# 2023-07-13T17:54:32 update
+-
+-# 2023-07-20T19:04:20 update
+-
+-# 2023-07-31T17:00:02 update
+-
+-# 2023-09-05T19:42:07 update
+-
+-# 2024-01-02T10:29:47 update
+-
+-# 2024-09-17T12:45:29 update
+-
+-# 2024-09-17T11:51:01 update
+-
+-# 2024-11-06T18:20:15 update
+-
+-# 2025-01-12T15:13:14 update
+-
+-# 2025-01-14T20:24:39 update
+-
+-# 2025-03-26T20:21:27 update
+-
+-# 2025-04-10T18:27:06 update
+-
+-# 2025-06-19T20:34:58 update
+-
+-# 2025-06-21T20:23:53 update
+-
+-# 2025-06-24T20:30:30 update
+-
+-# 2025-07-03T13:28:03 update
+-
+-# 2025-07-24T17:42:21 update
+-
+-# 2025-08-19T17:42:23 update
+-
+-# 2025-08-21T11:06:52 update
+-
+-# 2025-10-24T09:10:08 update
+-
+-# 2025-12-18T19:34:38 update
+-
+-# 2026-02-06T11:22:22 update
+-
+-# 2026-02-13T15:42:04 update
+-
+-# 2026-04-10T08:16:30 update
+-
+-# 2026-04-29T18:16:11 update
+diff --git a/tests/test_registry_traversal.py b/tests/test_registry_traversal.py
+new file mode 100644
+index 0000000..145cc9d
+--- /dev/null
++++ b/tests/test_registry_traversal.py
+@@ -0,0 +1,36 @@
++import pytest
++import os
++from src.agent.registry import AgentRegistry, RegistryError
++
++def test_handler_name_path_traversal():
++    registry = AgentRegistry()
++    agent_id = registry.register("test", "test.type")
++    
++    with pytest.raises(RegistryError) as excinfo:
++        registry.save_plugin_metadata(agent_id, "../../../etc/passwd", {"malicious": True})
++        
++    assert "path traversal attempt detected" in str(excinfo.value)
++    
++def test_handler_name_absolute_path():
++    registry = AgentRegistry()
++    agent_id = registry.register("test", "test.type")
++    
++    with pytest.raises(RegistryError) as excinfo:
++        registry.load_plugin_metadata(agent_id, "/etc/shadow")
++        
++    assert "path traversal attempt detected" in str(excinfo.value)
++    
++def test_valid_handler_metadata_lifecycle():
++    registry = AgentRegistry()
++    agent_id = registry.register("test", "test.type")
++    
++    # Save valid metadata
++    assert registry.save_plugin_metadata(agent_id, "valid_handler_name", {"config": 123}) == True
++    
++    # Load valid metadata
++    data = registry.load_plugin_metadata(agent_id, "valid_handler_name")
++    assert data["config"] == 123
++    
++    # Verify cleanup on delete
++    registry.delete(agent_id)
++    assert not (registry.metadata_root / agent_id).exists()

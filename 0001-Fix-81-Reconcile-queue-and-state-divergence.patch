@@ -1,0 +1,237 @@
+From 631eab438172c1cbbb3285696e507e4a63a0d865 Mon Sep 17 00:00:00 2001
+From: Bot <bot@example.com>
+Date: Tue, 19 May 2026 22:53:34 +0000
+Subject: [PATCH] Fix #81: Reconcile queue and state divergence
+
+---
+ src/agent/__init__.py              |  4 +-
+ src/orchestrator/scheduler.py      | 98 +++++++++++++++++++++++++-----
+ tests/test_scheduler_reconciler.py | 47 ++++++++++++++
+ 3 files changed, 132 insertions(+), 17 deletions(-)
+ create mode 100644 tests/test_scheduler_reconciler.py
+
+diff --git a/src/agent/__init__.py b/src/agent/__init__.py
+index dbfe929..12f9b5e 100644
+--- a/src/agent/__init__.py
++++ b/src/agent/__init__.py
+@@ -1,11 +1,11 @@
+ """Agent lifecycle management module."""
+ 
+-from .registry import AgentRegistry
++from .registry import AgentRegistry, AgentStatus
+ from .executor import AgentExecutor
+ from .runtime import AgentRuntime
+ from .sandbox import AgentSandbox
+ 
+-__all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
++__all__ = ["AgentRegistry", "AgentStatus", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
+ 
+ # 2019-02-05T12:34:30 update
+ 
+diff --git a/src/orchestrator/scheduler.py b/src/orchestrator/scheduler.py
+index db2f360..d12faa2 100644
+--- a/src/orchestrator/scheduler.py
++++ b/src/orchestrator/scheduler.py
+@@ -2,10 +2,13 @@
+ 
+ import asyncio
+ import heapq
++import logging
+ import time
+ from typing import Any, Dict, Optional
+ from uuid import uuid4
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ class PriorityQueue:
+     def __init__(self):
+@@ -35,13 +38,45 @@ class TaskScheduler:
+         self._queues: Dict[str, PriorityQueue] = {}
+         self._scheduled: Dict[str, float] = {}
+         self._in_flight: Dict[str, Dict] = {}
++        self._lifecycle: Dict[str, str] = {}
++        self._revisions: Dict[str, int] = {}
++        self._tasks: Dict[str, Dict] = {}
+         self._max_retries = 3
+ 
+-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+-        task_id = str(uuid4())
+-        task["id"] = task_id
+-        task["enqueued_at"] = time.time()
+-        task["retries"] = 0
++    def _bump_revision(self, task_id: str) -> None:
++        self._revisions[task_id] = self._revisions.get(task_id, 0) + 1
++
++    def _check_revision(self, task_id: str, expected: int) -> None:
++        if task_id in self._revisions and self._revisions[task_id] != expected:
++            actual = self._revisions[task_id]
++            logger.warning(f"Reconcile guard rejected transition for task {task_id}: revision mismatch (expected {expected}, actual {actual})")
++            raise ValueError(f"Revision mismatch for task {task_id}: expected {expected}, got {actual}")
++
++    def _check_lifecycle(self, task_id: str, valid_states: list) -> None:
++        state = self._lifecycle.get(task_id)
++        if state not in valid_states:
++            logger.warning(f"Reconcile guard rejected transition for task {task_id}: invalid lifecycle {state}")
++            raise ValueError(f"Invalid lifecycle transition for task {task_id}: current state is {state}, expected one of {valid_states}")
++
++    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0, revision: int = -1) -> str:
++        if "id" not in task:
++            task["id"] = str(uuid4())
++        task_id = task["id"]
++        
++        if revision != -1:
++            self._check_revision(task_id, revision)
++            
++        if task_id in self._lifecycle:
++            self._check_lifecycle(task_id, ["scheduled", "dispatched", "failed"])
++
++        if "enqueued_at" not in task:
++            task["enqueued_at"] = time.time()
++        if "retries" not in task:
++            task["retries"] = 0
++
++        self._lifecycle[task_id] = "queued"
++        self._bump_revision(task_id)
++        self._tasks[task_id] = task
+ 
+         if queue not in self._queues:
+             self._queues[queue] = PriorityQueue()
+@@ -49,8 +84,17 @@ class TaskScheduler:
+         return task_id
+ 
+     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+-        task_id = str(uuid4())
+-        task["id"] = task_id
++        if "id" not in task:
++            task["id"] = str(uuid4())
++        task_id = task["id"]
++        
++        if task_id in self._lifecycle:
++            self._check_lifecycle(task_id, ["queued", "failed"])
++            
++        self._lifecycle[task_id] = "scheduled"
++        self._bump_revision(task_id)
++        self._tasks[task_id] = task
++        
+         self._scheduled[task_id] = time.time() + delay
+         return task_id
+ 
+@@ -58,29 +102,53 @@ class TaskScheduler:
+         now = time.time()
+         expired = [tid for tid, t in self._scheduled.items() if t <= now]
+         for tid in expired:
+-            task = self._scheduled.pop(tid)
+-            if task:
+-                self.enqueue(task, queue)
++            t = self._scheduled.pop(tid)
++            task = self._tasks.get(tid)
++            if task and self._lifecycle.get(tid) == "scheduled":
++                self.enqueue(task, queue, revision=self._revisions.get(tid, 0))
+ 
+         if queue in self._queues and len(self._queues[queue]) > 0:
+             task = self._queues[queue].pop()
+             if task:
+-                self._in_flight[task["id"]] = task
++                task_id = task["id"]
++                self._check_lifecycle(task_id, ["queued"])
++                self._lifecycle[task_id] = "dispatched"
++                self._bump_revision(task_id)
++                self._in_flight[task_id] = task
+                 return task
+         return None
+ 
+-    def complete(self, task_id: str) -> bool:
+-        return self._in_flight.pop(task_id, None) is not None
++    def complete(self, task_id: str, revision: int = -1) -> bool:
++        if revision != -1:
++            self._check_revision(task_id, revision)
++            
++        task = self._in_flight.pop(task_id, None)
++        if task:
++            self._check_lifecycle(task_id, ["dispatched"])
++            self._lifecycle[task_id] = "completed"
++            self._bump_revision(task_id)
++            return True
++        return False
+ 
+-    def fail(self, task_id: str, queue: str = "default") -> bool:
++    def fail(self, task_id: str, queue: str = "default", revision: int = -1) -> bool:
++        if revision != -1:
++            self._check_revision(task_id, revision)
++            
+         task = self._in_flight.pop(task_id, None)
+         if task:
++            self._check_lifecycle(task_id, ["dispatched"])
+             task["retries"] += 1
+             if task["retries"] < self._max_retries:
+-                self.enqueue(task, queue, priority=task.get("priority", 0))
++                self._lifecycle[task_id] = "failed"
++                self._bump_revision(task_id)
++                self.enqueue(task, queue, priority=task.get("priority", 0), revision=self._revisions.get(task_id, 0))
+                 return True
++            else:
++                self._lifecycle[task_id] = "failed"
++                self._bump_revision(task_id)
+         return False
+ 
++
+ # 2019-04-25T08:37:12 update
+ 
+ # 2019-06-04T16:40:00 update
+diff --git a/tests/test_scheduler_reconciler.py b/tests/test_scheduler_reconciler.py
+new file mode 100644
+index 0000000..5baa241
+--- /dev/null
++++ b/tests/test_scheduler_reconciler.py
+@@ -0,0 +1,47 @@
++import pytest
++import asyncio
++from src.orchestrator.scheduler import TaskScheduler
++
++class TestTaskSchedulerReconciler:
++    def setup_method(self):
++        self.scheduler = TaskScheduler()
++
++    def test_reconcile_guard_revision_mismatch(self):
++        task_id = self.scheduler.enqueue({"type": "test"})
++        task = asyncio.run(self.scheduler.dequeue())
++        
++        with pytest.raises(ValueError, match="Revision mismatch"):
++            self.scheduler.complete(task_id, revision=999)
++
++    def test_reconcile_guard_lifecycle_invalid_transition(self):
++        task_id = self.scheduler.enqueue({"type": "test"})
++        task = asyncio.run(self.scheduler.dequeue())
++        
++        # Manually complete the task
++        self.scheduler.complete(task_id)
++        
++        # Try to fail it after it's already completed - should raise error
++        # but complete() popped it from in_flight.
++        # Wait, if it is popped, fail() will just return False.
++        # Let's test a lifecycle mismatch by trying to enqueue a dispatched task.
++        with pytest.raises(ValueError, match="Invalid lifecycle transition"):
++            self.scheduler.enqueue(task, revision=-1)
++
++    def test_partial_dispatch_failure(self):
++        # Simulate partial dispatch failure where the task is still in dispatched state
++        # but someone tries to fail it with a wrong revision
++        task_id = self.scheduler.enqueue({"type": "test"})
++        task = asyncio.run(self.scheduler.dequeue())
++        
++        with pytest.raises(ValueError, match="Revision mismatch"):
++            self.scheduler.fail(task_id, revision=999)
++            
++        assert self.scheduler.complete(task_id) is True
++
++    def test_schedule_then_enqueue(self):
++        task_id = self.scheduler.schedule({"type": "test"}, 0.01)
++        import time
++        time.sleep(0.02)
++        task = asyncio.run(self.scheduler.dequeue())
++        assert task is not None
++        assert self.scheduler._lifecycle[task_id] == "dispatched"
+-- 
+2.47.3
+

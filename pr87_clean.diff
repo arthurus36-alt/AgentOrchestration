@@ -1,0 +1,437 @@
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 00000000..ef7c3c9d
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,14 @@
++.git
++.github
++.pytest_cache
++.mypy_cache
++.ruff_cache
++__pycache__
++*.py[cod]
++*.pyo
++*.egg-info
++build
++dist
++logs
++docs/superpowers
++tests
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 3eac3408..61778b15 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -27,3 +27,23 @@ jobs:
+         run: uv run pytest --cov=src tests/
+       - name: Lint
+         run: uv run flake8 src/ tests/
++
++  docker-metadata-audit:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Build runtime image
++        run: |
++          docker build \
++            --provenance=false \
++            --build-arg INTERNAL_BUILD_CHANNEL=ci-private-channel-sentinel \
++            --build-arg INTERNAL_BUILD_REVISION=ci-private-revision-sentinel \
++            -t agent-orchestrator:metadata-audit .
++      - name: Audit final image metadata
++        run: |
++          python scripts/audit_image_metadata.py \
++            --image agent-orchestrator:metadata-audit \
++            --forbidden-name INTERNAL_BUILD_CHANNEL \
++            --forbidden-name INTERNAL_BUILD_REVISION \
++            --forbidden-value ci-private-channel-sentinel \
++            --forbidden-value ci-private-revision-sentinel
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 00000000..34376b2f
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,42 @@
++# syntax=docker/dockerfile:1
++
++ARG PYTHON_VERSION=3.11-slim
++
++FROM python:${PYTHON_VERSION} AS builder
++
++ARG INTERNAL_BUILD_CHANNEL=local
++ARG INTERNAL_BUILD_REVISION=unknown
++
++ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
++    PIP_NO_CACHE_DIR=1 \
++    VIRTUAL_ENV=/opt/agent-orchestrator
++ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
++
++WORKDIR /build
++
++RUN python -m venv "${VIRTUAL_ENV}"
++
++COPY pyproject.toml README.md ./
++COPY src ./src
++
++RUN pip install --upgrade pip && \
++    pip install .
++
++FROM python:${PYTHON_VERSION} AS runtime
++
++LABEL org.opencontainers.image.title="Agent Orchestrator" \
++      org.opencontainers.image.description="Enterprise Agent Orchestration Platform API" \
++      org.opencontainers.image.version="2.4.1"
++
++ENV PATH="/opt/agent-orchestrator/bin:${PATH}" \
++    PYTHONDONTWRITEBYTECODE=1 \
++    PYTHONUNBUFFERED=1
++
++WORKDIR /app
++
++COPY --from=builder /opt/agent-orchestrator /opt/agent-orchestrator
++COPY src ./src
++
++EXPOSE 8000
++
++CMD ["uvicorn", "src.api.server:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+diff --git a/Makefile b/Makefile
+index 8382a0ff..8ffcec24 100644
+--- a/Makefile
++++ b/Makefile
+@@ -21,7 +21,7 @@ run:
+ 	uvicorn src.api.server:create_app --reload --host 0.0.0.0 --port 8000
+ 
+ docker-build:
+-	docker compose -f infra/docker-compose.yml build
++	docker build --provenance=false -t agent-orchestrator:latest .
+ 
+ docker-up:
+ 	docker compose -f infra/docker-compose.yml up -d
+diff --git a/infra/docker-compose.yml b/infra/docker-compose.yml
+new file mode 100644
+index 00000000..785dfcae
+--- /dev/null
++++ b/infra/docker-compose.yml
+@@ -0,0 +1,11 @@
++services:
++  api:
++    build:
++      context: ..
++      dockerfile: Dockerfile
++      args:
++        INTERNAL_BUILD_CHANNEL: local
++        INTERNAL_BUILD_REVISION: local
++    image: agent-orchestrator:latest
++    ports:
++      - "8000:8000"
+diff --git a/scripts/audit_image_metadata.py b/scripts/audit_image_metadata.py
+new file mode 100644
+index 00000000..5d48dfa9
+--- /dev/null
++++ b/scripts/audit_image_metadata.py
+@@ -0,0 +1,195 @@
++"""Audit Docker image history and labels for build-only metadata."""
++
++import argparse
++import json
++import subprocess
++from pathlib import Path
++from typing import Any, Dict, Iterable, List, Optional
++
++
++APPROVED_RUNTIME_LABELS = {
++    "org.opencontainers.image.title",
++    "org.opencontainers.image.description",
++    "org.opencontainers.image.version",
++    "org.opencontainers.image.source",
++    "org.opencontainers.image.revision",
++    "org.opencontainers.image.created",
++    "org.opencontainers.image.licenses",
++}
++
++
++class MetadataAuditError(RuntimeError):
++    """Raised when final image metadata contains disallowed content."""
++
++
++def audit_metadata(
++    history: Iterable[Dict[str, Any]],
++    labels: Optional[Dict[str, str]],
++    forbidden_values: Iterable[str],
++    forbidden_names: Iterable[str] = (),
++    approved_labels: Iterable[str] = APPROVED_RUNTIME_LABELS,
++) -> None:
++    forbidden = [value for value in forbidden_values if value]
++    names = [name for name in forbidden_names if name]
++    approved = set(approved_labels)
++    label_map = labels or {}
++
++    _audit_history(history, forbidden, names)
++    _audit_labels(label_map, forbidden, names, approved)
++
++
++def load_history(path: Path) -> List[Dict[str, Any]]:
++    data = json.loads(path.read_text(encoding="utf-8"))
++    if not isinstance(data, list):
++        raise MetadataAuditError("history JSON must be a list")
++    return data
++
++
++def load_labels(path: Path) -> Dict[str, str]:
++    data = json.loads(path.read_text(encoding="utf-8"))
++    if data is None:
++        return {}
++    if not isinstance(data, dict):
++        raise MetadataAuditError("labels JSON must be an object")
++    return {str(key): str(value) for key, value in data.items()}
++
++
++def docker_history(image: str) -> List[Dict[str, Any]]:
++    output = _run_docker(
++        [
++            "docker",
++            "history",
++            "--no-trunc",
++            "--format",
++            "{{json .}}",
++            image,
++        ]
++    )
++    history = []
++    for line in output.splitlines():
++        line = line.strip()
++        if line:
++            history.append(json.loads(line))
++    return history
++
++
++def docker_labels(image: str) -> Dict[str, str]:
++    output = _run_docker(
++        [
++            "docker",
++            "image",
++            "inspect",
++            "--format",
++            "{{json .Config.Labels}}",
++            image,
++        ]
++    ).strip()
++    if not output or output == "null":
++        return {}
++    data = json.loads(output)
++    return {str(key): str(value) for key, value in data.items()}
++
++
++def _audit_history(
++    history: Iterable[Dict[str, Any]],
++    forbidden_values: Iterable[str],
++    forbidden_names: Iterable[str],
++) -> None:
++    history_text = "\n".join(
++        str(entry.get("CreatedBy") or entry.get("created_by") or entry)
++        for entry in history
++    )
++    for name in forbidden_names:
++        if name in history_text:
++            raise MetadataAuditError(
++                "forbidden build-only name found in image history"
++            )
++    for value in forbidden_values:
++        if value in history_text:
++            raise MetadataAuditError(
++                "forbidden build-only value found in image history"
++            )
++
++
++def _audit_labels(
++    labels: Dict[str, str],
++    forbidden_values: Iterable[str],
++    forbidden_names: Iterable[str],
++    approved_labels: Iterable[str],
++) -> None:
++    approved = set(approved_labels)
++    for key, value in labels.items():
++        if key not in approved:
++            raise MetadataAuditError(
++                f"unapproved label in runtime image: {key}"
++            )
++        label_text = f"{key}={value}"
++        for name in forbidden_names:
++            if name in label_text:
++                raise MetadataAuditError(
++                    f"forbidden build-only name found in runtime label: {key}"
++                )
++        for forbidden in forbidden_values:
++            if forbidden in value:
++                raise MetadataAuditError(
++                    f"forbidden build-only value found in runtime label: {key}"
++                )
++
++
++def _run_docker(command: List[str]) -> str:
++    completed = subprocess.run(
++        command,
++        check=True,
++        text=True,
++        capture_output=True,
++    )
++    return completed.stdout
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(
++        description="Audit final Docker image history and labels."
++    )
++    parser.add_argument("--image", help="Docker image tag to inspect")
++    parser.add_argument(
++        "--history-json",
++        type=Path,
++        help="Read Docker history entries from a JSON fixture",
++    )
++    parser.add_argument(
++        "--labels-json",
++        type=Path,
++        help="Read Docker labels from a JSON fixture",
++    )
++    parser.add_argument(
++        "--forbidden-value",
++        action="append",
++        default=[],
++        help="Build-only value that must not appear in final metadata",
++    )
++    parser.add_argument(
++        "--forbidden-name",
++        action="append",
++        default=[],
++        help="Build-only argument name that must not appear in final metadata",
++    )
++    args = parser.parse_args()
++
++    if args.image:
++        history = docker_history(args.image)
++        labels = docker_labels(args.image)
++    elif args.history_json and args.labels_json:
++        history = load_history(args.history_json)
++        labels = load_labels(args.labels_json)
++    else:
++        parser.error(
++            "provide --image or both --history-json and --labels-json"
++        )
++
++    audit_metadata(history, labels, args.forbidden_value, args.forbidden_name)
++    print("Docker metadata audit passed")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_docker_metadata_audit.py b/tests/test_docker_metadata_audit.py
+new file mode 100644
+index 00000000..8f6599e1
+--- /dev/null
++++ b/tests/test_docker_metadata_audit.py
+@@ -0,0 +1,104 @@
++import pytest
++
++from scripts.audit_image_metadata import (
++    MetadataAuditError,
++    audit_metadata,
++)
++
++
++def test_audit_accepts_clean_history_and_approved_labels():
++    history = [
++        {"CreatedBy": "/bin/sh -c pip install ."},
++        {"CreatedBy": "CMD [\"uvicorn\", \"src.api.server:create_app\"]"},
++    ]
++    labels = {
++        "org.opencontainers.image.title": "Agent Orchestrator",
++        "org.opencontainers.image.description": (
++            "Enterprise Agent Orchestration Platform API"
++        ),
++        "org.opencontainers.image.version": "2.4.1",
++    }
++
++    audit_metadata(
++        history,
++        labels,
++        forbidden_values=["internal-build-token"],
++        forbidden_names=["INTERNAL_BUILD_CHANNEL"],
++    )
++
++
++def test_audit_rejects_forbidden_value_in_final_history():
++    history = [
++        {"CreatedBy": "/bin/sh -c echo internal-build-token"},
++    ]
++
++    with pytest.raises(MetadataAuditError, match="image history"):
++        audit_metadata(
++            history,
++            {},
++            forbidden_values=["internal-build-token"],
++        )
++
++
++def test_audit_rejects_build_only_name_in_final_history():
++    history = [
++        {"CreatedBy": "/bin/sh -c ARG INTERNAL_BUILD_CHANNEL"},
++    ]
++
++    with pytest.raises(MetadataAuditError, match="image history"):
++        audit_metadata(
++            history,
++            {},
++            forbidden_values=[],
++            forbidden_names=["INTERNAL_BUILD_CHANNEL"],
++        )
++
++
++def test_audit_rejects_forbidden_value_in_runtime_label():
++    labels = {
++        "org.opencontainers.image.title": "internal-build-token",
++    }
++
++    with pytest.raises(MetadataAuditError, match="runtime label"):
++        audit_metadata(
++            [],
++            labels,
++            forbidden_values=["internal-build-token"],
++        )
++
++
++def test_audit_rejects_unapproved_runtime_label():
++    labels = {
++        "org.opencontainers.image.title": "Agent Orchestrator",
++        "com.example.internal.build-channel": "ci",
++    }
++
++    with pytest.raises(MetadataAuditError, match="unapproved label"):
++        audit_metadata(
++            [],
++            labels,
++            forbidden_values=[],
++        )
++
++
++def test_dockerfile_keeps_build_args_out_of_runtime_stage():
++    dockerfile = open("Dockerfile", encoding="utf-8").read()
++    runtime_stage = dockerfile.split(
++        "FROM python:${PYTHON_VERSION} AS runtime",
++        1,
++    )[1]
++
++    assert "ARG INTERNAL_BUILD_CHANNEL" not in runtime_stage
++    assert "ARG INTERNAL_BUILD_REVISION" not in runtime_stage
++    assert "ci-private-channel-sentinel" not in dockerfile
++    assert "ci-private-revision-sentinel" not in dockerfile
++
++
++def test_ci_builds_image_then_runs_metadata_audit():
++    workflow = open(".github/workflows/ci.yml", encoding="utf-8").read()
++    build_index = workflow.index("docker build")
++    audit_index = workflow.index("scripts/audit_image_metadata.py")
++
++    assert build_index < audit_index
++    assert "--forbidden-value ci-private-channel-sentinel" in workflow
++    assert "--forbidden-value ci-private-revision-sentinel" in workflow

@@ -1,0 +1,66 @@
+From 5466b86892a87159e86d3be48acf9593b390025f Mon Sep 17 00:00:00 2001
+From: Bot <bot@example.com>
+Date: Wed, 20 May 2026 00:50:17 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#137:=20Coerce=20boolean=20environment=20?=
+ =?UTF-8?q?overrides=20=E2=80=94=20AO=5F=20parsing?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/common/config.py          | 10 +++++++++-
+ tests/test_config_booleans.py | 14 ++++++++++++++
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+ create mode 100644 tests/test_config_booleans.py
+
+diff --git a/src/common/config.py b/src/common/config.py
+index 0b7b251..d88dde8 100644
+--- a/src/common/config.py
++++ b/src/common/config.py
+@@ -23,6 +23,14 @@ class Config:
+                 f"failed to parse JSON config file '{path}' at line {exc.lineno}, column {exc.colno}: {exc.msg}"
+             ) from exc
+ 
++    def _coerce_value(self, value: str) -> Any:
++        lower = value.lower()
++        if lower == "true":
++            return True
++        elif lower == "false":
++            return False
++        return value
++
+     def _load_env_overrides(self) -> None:
+         prefix = "AO_"
+         mapped_keys = {}
+@@ -32,7 +40,7 @@ class Config:
+                 if config_key in mapped_keys:
+                     raise ValueError(f"Case collision detected for env overrides: '{mapped_keys[config_key]}' and '{key}' both map to '{config_key}'")
+                 mapped_keys[config_key] = key
+-                self._set_nested(config_key, value)
++                self._set_nested(config_key, self._coerce_value(value))
+ 
+     def _set_nested(self, key: str, value: Any) -> None:
+         parts = key.split(".")
+diff --git a/tests/test_config_booleans.py b/tests/test_config_booleans.py
+new file mode 100644
+index 0000000..039b9b3
+--- /dev/null
++++ b/tests/test_config_booleans.py
+@@ -0,0 +1,14 @@
++import pytest
++from src.common.config import Config
++import os
++
++def test_boolean_env_overrides_coercion(monkeypatch):
++    monkeypatch.setenv("AO_FEATURE_ENABLED", "true")
++    monkeypatch.setenv("AO_DEBUG_MODE", "false")
++    monkeypatch.setenv("AO_SOME_STRING", "Trueish")
++
++    config = Config()
++
++    assert config.get("feature.enabled") is True
++    assert config.get("debug.mode") is False
++    assert config.get("some.string") == "Trueish"
+-- 
+2.47.3
+

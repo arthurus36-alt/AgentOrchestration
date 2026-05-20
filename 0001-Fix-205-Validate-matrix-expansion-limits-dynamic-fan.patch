@@ -1,0 +1,157 @@
+From affa807f903caac2d26faccca5442dfde9fda40a Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 03:57:26 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#205:=20Validate=20matrix=20expansion=20l?=
+ =?UTF-8?q?imits=20=E2=80=94=20dynamic=20fan-out?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/orchestrator/workflow.py  | 40 +++++++++++++++++++++++++++++------
+ tests/test_workflow_matrix.py | 38 +++++++++++++++++++++++++++++++++
+ 2 files changed, 71 insertions(+), 7 deletions(-)
+ create mode 100644 tests/test_workflow_matrix.py
+
+diff --git a/src/orchestrator/workflow.py b/src/orchestrator/workflow.py
+index 6d853c1..1b49e58 100644
+--- a/src/orchestrator/workflow.py
++++ b/src/orchestrator/workflow.py
+@@ -4,6 +4,8 @@ from enum import Enum
+ from typing import Any, Callable, Dict, List, Optional
+ from uuid import uuid4
+ 
++class MatrixExpansionLimitExceeded(RuntimeError):
++    """Raised when a workflow attempts to fan-out beyond allowed bounds."""
+ 
+ class StepStatus(Enum):
+     PENDING = "pending"
+@@ -12,19 +14,18 @@ class StepStatus(Enum):
+     FAILED = "failed"
+     SKIPPED = "skipped"
+ 
+-
+ class WorkflowStep:
+-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
++    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300, matrix: Optional[List[Any]] = None):
+         self.id = str(uuid4())
+         self.name = name
+         self.handler = handler
+         self.retries = retries
+         self.timeout = timeout
++        self.matrix = matrix or []
+         self.status = StepStatus.PENDING
+         self.result: Any = None
+         self.error: Optional[str] = None
+ 
+-
+ class Workflow:
+     def __init__(self, name: str, description: str = ""):
+         self.id = str(uuid4())
+@@ -42,10 +43,11 @@ class Workflow:
+     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
+         return self._step_map.get(step_id)
+ 
+-
+ class WorkflowManager:
+-    def __init__(self):
++    def __init__(self, max_matrix_size: int = 256):
+         self._workflows: Dict[str, Workflow] = {}
++        self._max_matrix_size = max_matrix_size
++        self._audit_events: List[Dict[str, Any]] = []
+ 
+     def create_workflow(self, name: str, description: str = "") -> Workflow:
+         workflow = Workflow(name, description)
+@@ -66,12 +68,33 @@ class WorkflowManager:
+         if not workflow:
+             return False
+ 
++        # Pre-flight matrix expansion validation
++        for step in workflow.steps:
++            if step.matrix and len(step.matrix) > self._max_matrix_size:
++                self._audit_events.append({
++                    "workflow_id": workflow_id,
++                    "step_id": step.id,
++                    "event": "matrix_expansion_rejected",
++                    "reason": f"matrix size {len(step.matrix)} exceeds limit {self._max_matrix_size}"
++                })
++                workflow.status = StepStatus.FAILED
++                step.status = StepStatus.FAILED
++                step.error = "MatrixExpansionLimitExceeded"
++                raise MatrixExpansionLimitExceeded(f"Step {step.name} matrix expansion ({len(step.matrix)}) exceeds limit {self._max_matrix_size}.")
++
+         workflow.status = StepStatus.RUNNING
+         for step in workflow.steps:
+             step.status = StepStatus.RUNNING
+             try:
+-                result = step.handler()
+-                step.result = result
++                # Mocking matrix execution by passing inputs if present
++                if step.matrix:
++                    results = []
++                    for item in step.matrix:
++                        results.append(step.handler(item))
++                    step.result = results
++                else:
++                    step.result = step.handler()
++                    
+                 step.status = StepStatus.COMPLETED
+             except Exception as e:
+                 step.error = str(e)
+@@ -82,6 +105,9 @@ class WorkflowManager:
+         workflow.status = StepStatus.COMPLETED
+         return True
+ 
++    def audit_events(self) -> List[Dict[str, Any]]:
++        return self._audit_events
++
+ # 2019-03-27T19:58:07 update
+ 
+ # 2019-05-09T09:42:56 update
+diff --git a/tests/test_workflow_matrix.py b/tests/test_workflow_matrix.py
+new file mode 100644
+index 0000000..e697669
+--- /dev/null
++++ b/tests/test_workflow_matrix.py
+@@ -0,0 +1,38 @@
++import pytest
++from src.orchestrator.workflow import WorkflowManager, WorkflowStep, MatrixExpansionLimitExceeded, StepStatus
++
++def test_workflow_matrix_expansion_limit_validation():
++    manager = WorkflowManager(max_matrix_size=5)
++    workflow = manager.create_workflow("matrix test")
++    
++    # Valid step
++    step1 = WorkflowStep("step1", lambda x: x * 2, matrix=[1, 2, 3])
++    # Invalid step
++    step2 = WorkflowStep("step2", lambda x: x * 2, matrix=[1, 2, 3, 4, 5, 6])
++    
++    workflow.add_step(step1)
++    workflow.add_step(step2)
++    
++    with pytest.raises(MatrixExpansionLimitExceeded, match="exceeds limit 5"):
++        manager.execute_workflow(workflow.id)
++        
++    assert workflow.status == StepStatus.FAILED
++    assert step2.status == StepStatus.FAILED
++    assert step2.error == "MatrixExpansionLimitExceeded"
++    
++    audit = manager.audit_events()
++    assert audit[-1]["event"] == "matrix_expansion_rejected"
++    assert audit[-1]["workflow_id"] == workflow.id
++
++def test_workflow_matrix_expansion_success():
++    manager = WorkflowManager(max_matrix_size=5)
++    workflow = manager.create_workflow("matrix test")
++    
++    def handler(item):
++        return item * 2
++        
++    step1 = WorkflowStep("step1", handler, matrix=[1, 2, 3])
++    workflow.add_step(step1)
++    
++    assert manager.execute_workflow(workflow.id) is True
++    assert step1.result == [2, 4, 6]
+-- 
+2.47.3
+

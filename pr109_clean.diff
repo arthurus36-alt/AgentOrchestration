@@ -1,0 +1,182 @@
+diff --git a/src/common/artifact_backup.py b/src/common/artifact_backup.py
+new file mode 100644
+index 00000000..7b5580bb
+--- /dev/null
++++ b/src/common/artifact_backup.py
+@@ -0,0 +1,93 @@
++"""Backup artifact restore validation helpers."""
++
++import gzip
++import hashlib
++from dataclasses import dataclass
++from typing import Iterable, List, Optional, Protocol
++
++
++class ArtifactStore(Protocol):
++    def download(self, key: str) -> bytes:
++        """Return the compressed artifact bytes for key."""
++
++
++@dataclass(frozen=True)
++class ArtifactMetadata:
++    key: str
++    digest: str
++    compression: str = "gzip"
++
++
++@dataclass(frozen=True)
++class ArtifactValidationFailure:
++    key: str
++    reason: str
++
++
++@dataclass(frozen=True)
++class ArtifactValidationResult:
++    ok: bool
++    checked_count: int
++    sampled_keys: List[str]
++    failures: List[ArtifactValidationFailure]
++
++
++class ArtifactBackupValidator:
++    def __init__(
++        self,
++        store: ArtifactStore,
++        sample_size: Optional[int] = None,
++    ):
++        if sample_size is not None and sample_size < 0:
++            raise ValueError("sample_size must be non-negative")
++        self.store = store
++        self.sample_size = sample_size
++
++    def validate(
++        self,
++        artifacts: Iterable[ArtifactMetadata],
++    ) -> ArtifactValidationResult:
++        sampled = self._sample(artifacts)
++        failures: List[ArtifactValidationFailure] = []
++
++        for artifact in sampled:
++            try:
++                compressed_payload = self.store.download(artifact.key)
++                payload = self._decompress(artifact, compressed_payload)
++            except Exception:
++                failures.append(
++                    ArtifactValidationFailure(
++                        artifact.key,
++                        "decompress failed",
++                    )
++                )
++                continue
++
++            actual_digest = hashlib.sha256(payload).hexdigest()
++            if actual_digest != artifact.digest:
++                failures.append(
++                    ArtifactValidationFailure(artifact.key, "digest mismatch")
++                )
++
++        return ArtifactValidationResult(
++            ok=not failures,
++            checked_count=len(sampled),
++            sampled_keys=[artifact.key for artifact in sampled],
++            failures=failures,
++        )
++
++    def _sample(
++        self,
++        artifacts: Iterable[ArtifactMetadata],
++    ) -> List[ArtifactMetadata]:
++        candidates = list(artifacts)
++        if self.sample_size is None:
++            return candidates
++        return candidates[: self.sample_size]
++
++    def _decompress(self, artifact: ArtifactMetadata, payload: bytes) -> bytes:
++        if artifact.compression != "gzip":
++            raise ValueError(
++                f"unsupported compression: {artifact.compression}"
++            )
++        return gzip.decompress(payload)
+diff --git a/tests/test_artifact_backup.py b/tests/test_artifact_backup.py
+new file mode 100644
+index 00000000..06470407
+--- /dev/null
++++ b/tests/test_artifact_backup.py
+@@ -0,0 +1,77 @@
++import gzip
++import hashlib
++
++from src.common.artifact_backup import (
++    ArtifactBackupValidator,
++    ArtifactMetadata,
++)
++
++
++class RecordingArtifactStore:
++    def __init__(self, objects):
++        self.objects = objects
++        self.downloaded = []
++
++    def download(self, key):
++        self.downloaded.append(key)
++        return self.objects[key]
++
++
++def compressed(payload):
++    return gzip.compress(payload)
++
++
++def digest(payload):
++    return hashlib.sha256(payload).hexdigest()
++
++
++def test_validator_samples_and_restores_compressed_artifacts():
++    payload = b'{"task":"alpha","result":"complete"}'
++    skipped_payload = b'{"task":"beta","result":"complete"}'
++    store = RecordingArtifactStore(
++        {
++            "alpha.json.gz": compressed(payload),
++            "beta.json.gz": compressed(skipped_payload),
++        }
++    )
++    artifacts = [
++        ArtifactMetadata(key="alpha.json.gz", digest=digest(payload)),
++        ArtifactMetadata(key="beta.json.gz", digest=digest(skipped_payload)),
++    ]
++
++    result = ArtifactBackupValidator(store, sample_size=1).validate(artifacts)
++
++    assert result.ok is True
++    assert result.sampled_keys == ["alpha.json.gz"]
++    assert result.checked_count == 1
++    assert result.failures == []
++    assert store.downloaded == ["alpha.json.gz"]
++
++
++def test_decompression_failure_marks_validation_failed():
++    store = RecordingArtifactStore({"broken.json.gz": b"not gzip data"})
++    artifacts = [
++        ArtifactMetadata(key="broken.json.gz", digest=digest(b"unused")),
++    ]
++
++    result = ArtifactBackupValidator(store).validate(artifacts)
++
++    assert result.ok is False
++    assert result.checked_count == 1
++    assert result.failures[0].key == "broken.json.gz"
++    assert "decompress" in result.failures[0].reason
++
++
++def test_digest_mismatch_marks_validation_failed():
++    payload = b'{"task":"alpha","result":"complete"}'
++    store = RecordingArtifactStore({"alpha.json.gz": compressed(payload)})
++    artifacts = [
++        ArtifactMetadata(key="alpha.json.gz", digest=digest(b"different")),
++    ]
++
++    result = ArtifactBackupValidator(store).validate(artifacts)
++
++    assert result.ok is False
++    assert result.checked_count == 1
++    assert result.failures[0].key == "alpha.json.gz"
++    assert "digest mismatch" == result.failures[0].reason

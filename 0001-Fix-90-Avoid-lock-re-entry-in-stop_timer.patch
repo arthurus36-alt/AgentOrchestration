@@ -1,0 +1,25 @@
+From 372fadaccd313816b343a437ac5638422b6bd1cd Mon Sep 17 00:00:00 2001
+From: Bot <bot@example.com>
+Date: Tue, 19 May 2026 23:26:38 +0000
+Subject: [PATCH] Fix #90: Avoid lock re-entry in stop_timer
+
+---
+ src/common/metrics.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/common/metrics.py b/src/common/metrics.py
+index 99d82f4..3d27ac0 100644
+--- a/src/common/metrics.py
++++ b/src/common/metrics.py
+@@ -34,7 +34,7 @@ class MetricsCollector:
+         with self._lock:
+             if metric in self._timers:
+                 duration = time.time() - self._timers.pop(metric)
+-                self.observe(metric, duration)
++                self._histograms[metric].append(duration)
+                 return duration
+         return 0.0
+ 
+-- 
+2.47.3
+

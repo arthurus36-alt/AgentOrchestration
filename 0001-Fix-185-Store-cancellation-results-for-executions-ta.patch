@@ -1,0 +1,60 @@
+From d97baf1662973bd624658d47ac42ec71d41a3ffd Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 03:08:47 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#185:=20Store=20cancellation=20results=20?=
+ =?UTF-8?q?for=20executions=20=E2=80=94=20task=20execution?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ tests/test_executor_cancel.py | 37 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+ create mode 100644 tests/test_executor_cancel.py
+
+diff --git a/tests/test_executor_cancel.py b/tests/test_executor_cancel.py
+new file mode 100644
+index 0000000..66d009f
+--- /dev/null
++++ b/tests/test_executor_cancel.py
+@@ -0,0 +1,37 @@
++import asyncio
++import pytest
++from src.agent.executor import AgentExecutor
++
++@pytest.mark.asyncio
++async def test_cancelled_execution_stores_result():
++    executor = AgentExecutor()
++    
++    async def slow_handler(agent_id, task):
++        await asyncio.sleep(10)
++        return "done"
++        
++    # Start task in background
++    exec_task = asyncio.create_task(executor.execute("agent-1", {"id": "task-1"}, slow_handler))
++    
++    # Wait a bit for it to register in active_tasks
++    await asyncio.sleep(0.1)
++    
++    # Grab the execution_id
++    execution_ids = list(executor._active_tasks.keys())
++    assert len(execution_ids) == 1
++    execution_id = execution_ids[0]
++    
++    # Cancel it
++    assert executor.cancel(execution_id) is True
++    
++    # Wait for task to finish resolving its cancellation
++    try:
++        await exec_task
++    except asyncio.CancelledError:
++        pass
++        
++    # Check the result
++    res = executor.get_result(execution_id)
++    assert res is not None
++    assert res.get("status") == "cancelled"
++    assert res.get("error") == "Execution cancelled"
+-- 
+2.47.3
+

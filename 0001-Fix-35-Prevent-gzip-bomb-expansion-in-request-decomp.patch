@@ -1,0 +1,193 @@
+From 4adcd3711120f484b60a0101279392140bb77fd8 Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 03:49:26 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#35:=20Prevent=20gzip=20bomb=20expansion?=
+ =?UTF-8?q?=20in=20request=20decompression=20=E2=80=94=20body=20middleware?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/api/middleware.py              | 74 ++++++++++++++++++++++++++++--
+ src/api/server.py                  |  4 +-
+ tests/test_middleware_bodyguard.py | 39 ++++++++++++++++
+ 3 files changed, 112 insertions(+), 5 deletions(-)
+ create mode 100644 tests/test_middleware_bodyguard.py
+
+diff --git a/src/api/middleware.py b/src/api/middleware.py
+index 08890d6..6fe7109 100644
+--- a/src/api/middleware.py
++++ b/src/api/middleware.py
+@@ -2,11 +2,13 @@
+ 
+ import time
+ import logging
++import gzip
++import zlib
+ import asyncio
+ from typing import Callable
+ from starlette.middleware.base import BaseHTTPMiddleware
+ from starlette.requests import Request
+-from starlette.responses import Response
++from starlette.responses import Response, JSONResponse
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -48,7 +50,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
+ 
+ class IngressMiddleware(BaseHTTPMiddleware):
+     async def dispatch(self, request: Request, call_next: Callable) -> Response:
+-        # Prevent expensive body parsing before rate limits by rejecting oversized payloads early
+         content_length = request.headers.get("Content-Length")
+         if content_length and int(content_length) > 10 * 1024 * 1024:
+             return Response(status_code=413, content="Payload Too Large")
+@@ -57,10 +58,77 @@ class IngressMiddleware(BaseHTTPMiddleware):
+             response = await call_next(request)
+             return response
+         finally:
+-            # Clear local state if any was accumulated
+             pass
+ 
+ 
++class BodyGuardMiddleware(BaseHTTPMiddleware):
++    def __init__(self, app, max_compressed_size=1024*1024*5, max_uncompressed_size=1024*1024*20, max_ratio=20):
++        super().__init__(app)
++        self.max_compressed_size = max_compressed_size
++        self.max_uncompressed_size = max_uncompressed_size
++        self.max_ratio = max_ratio
++
++    async def dispatch(self, request: Request, call_next: Callable) -> Response:
++        encoding = request.headers.get("Content-Encoding", "").lower()
++        
++        if "gzip" in encoding:
++            content_length = request.headers.get("Content-Length")
++            
++            if content_length and int(content_length) > self.max_compressed_size:
++                return JSONResponse(
++                    status_code=413, 
++                    content={"error": "Payload Too Large (Compressed limit exceeded)"},
++                    headers={"X-Body-Guard": "rejected"}
++                )
++
++            body = b""
++            uncompressed_size = 0
++            
++            try:
++                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
++                async for chunk in request.stream():
++                    body += chunk
++                    
++                    if len(body) > self.max_compressed_size:
++                        return JSONResponse(status_code=413, content={"error": "Payload Too Large"}, headers={"X-Body-Guard": "rejected"})
++                        
++                    uncompressed_chunk = decompressor.decompress(chunk)
++                    uncompressed_size += len(uncompressed_chunk)
++                    
++                    if uncompressed_size > self.max_uncompressed_size:
++                        return JSONResponse(
++                            status_code=413, 
++                            content={"error": "Payload Too Large (Uncompressed limit exceeded)"},
++                            headers={"X-Body-Guard": "rejected"}
++                        )
++                        
++                    if len(body) > 1024: 
++                        ratio = uncompressed_size / len(body)
++                        if ratio > self.max_ratio:
++                            return JSONResponse(
++                                status_code=413, 
++                                content={"error": "Payload Rejected (Suspicious compression ratio)"},
++                                headers={"X-Body-Guard": "rejected"}
++                            )
++
++                async def new_receive():
++                    return {"type": "http.request", "body": body, "more_body": False}
++                request._receive = new_receive
++                
++            except zlib.error:
++                return JSONResponse(status_code=400, content={"error": "Bad Request (Invalid gzip payload)"}, headers={"X-Body-Guard": "rejected"})
++            finally:
++                body = None
++                decompressor = None
++
++        response = await call_next(request)
++        
++        if "gzip" in encoding:
++            response.headers["X-Body-Guard"] = "ok"
++            
++        return response
++
++
+ class LoggingMiddleware(BaseHTTPMiddleware):
+     async def dispatch(self, request: Request, call_next: Callable) -> Response:
+         start = time.time()
+diff --git a/src/api/server.py b/src/api/server.py
+index d6fbf52..ba9485e 100644
+--- a/src/api/server.py
++++ b/src/api/server.py
+@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.middleware.trustedhost import TrustedHostMiddleware
+ 
+ from .routes import router
+-from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware, IngressMiddleware
++from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware, IngressMiddleware, BodyGuardMiddleware
+ 
+ def create_app(config: Dict = None) -> FastAPI:
+     app = FastAPI(
+@@ -29,8 +29,8 @@ def create_app(config: Dict = None) -> FastAPI:
+ 
+     app.add_middleware(TrustedHostMiddleware, allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","))
+ 
+-    # Add IngressMiddleware before Auth/RateLimit so it guards body parsing
+     app.add_middleware(IngressMiddleware)
++    app.add_middleware(BodyGuardMiddleware)
+     app.add_middleware(AuthMiddleware)
+     app.add_middleware(RateLimitMiddleware)
+     app.add_middleware(LoggingMiddleware)
+diff --git a/tests/test_middleware_bodyguard.py b/tests/test_middleware_bodyguard.py
+new file mode 100644
+index 0000000..a929e00
+--- /dev/null
++++ b/tests/test_middleware_bodyguard.py
+@@ -0,0 +1,39 @@
++import pytest
++import gzip
++from fastapi.testclient import TestClient
++from fastapi import FastAPI
++from src.api.middleware import BodyGuardMiddleware
++from starlette.responses import JSONResponse
++
++app = FastAPI()
++app.add_middleware(BodyGuardMiddleware, max_compressed_size=1024, max_uncompressed_size=2048, max_ratio=2)
++
++@app.post("/test")
++async def dummy_endpoint():
++    return JSONResponse({"status": "ok"})
++
++client = TestClient(app)
++
++def test_bodyguard_accepts_normal_gzip():
++    payload = b"normal string that compresses well"
++    compressed = gzip.compress(payload)
++    
++    response = client.post("/test", content=compressed, headers={"Content-Encoding": "gzip", "Content-Length": str(len(compressed))})
++    assert response.status_code == 200
++    assert response.headers["X-Body-Guard"] == "ok"
++
++def test_bodyguard_rejects_gzip_bomb_ratio():
++    # Large payload of zeros compresses extremely well
++    payload = b"0" * 4096
++    compressed = gzip.compress(payload)
++    
++    # Exceeds max uncompressed and max ratio limits
++    response = client.post("/test", content=compressed, headers={"Content-Encoding": "gzip"})
++    assert response.status_code == 413
++    assert "rejected" in response.headers.get("X-Body-Guard", "")
++
++def test_bodyguard_rejects_large_content_length():
++    compressed = b"x" * 2048
++    response = client.post("/test", content=compressed, headers={"Content-Encoding": "gzip", "Content-Length": "2048"})
++    assert response.status_code == 413
++    assert "Compressed limit exceeded" in response.text
+-- 
+2.47.3
+

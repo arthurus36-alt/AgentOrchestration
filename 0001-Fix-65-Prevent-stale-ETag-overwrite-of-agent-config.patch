@@ -1,0 +1,259 @@
+From 9c53c87e18d23492978b1b16a2760ec6cf2c6027 Mon Sep 17 00:00:00 2001
+From: Bot <bot@example.com>
+Date: Tue, 19 May 2026 23:11:32 +0000
+Subject: [PATCH] Fix #65: Prevent stale ETag overwrite of agent config
+
+---
+ src/agent/registry.py           |  2 +-
+ src/api/agent_config.py         | 70 +++++++++++++++++++++++++++++++++
+ src/api/routes.py               | 27 +++++++++----
+ tests/test_agent_config_etag.py | 67 +++++++++++++++++++++++++++++++
+ 4 files changed, 158 insertions(+), 8 deletions(-)
+ create mode 100644 src/api/agent_config.py
+ create mode 100644 tests/test_agent_config_etag.py
+
+diff --git a/src/agent/registry.py b/src/agent/registry.py
+index fbedbe1..c8f7a61 100644
+--- a/src/agent/registry.py
++++ b/src/agent/registry.py
+@@ -30,7 +30,7 @@ class AgentRegistry:
+             "name": name,
+             "type": agent_type,
+             "status": AgentStatus.PENDING.value,
+-            "config": config or {},
++            "config": config or {}, "config_version": 1,
+             "created_at": timestamp,
+             "updated_at": timestamp,
+             "version": "1.0.0",
+diff --git a/src/api/agent_config.py b/src/api/agent_config.py
+new file mode 100644
+index 0000000..9174e94
+--- /dev/null
++++ b/src/api/agent_config.py
+@@ -0,0 +1,70 @@
++"""Agent config optimistic update service."""
++
++import time
++from typing import Any, Dict, Optional
++
++class AgentConfigUpdateError(ValueError):
++    def __init__(self, status_code: int, detail: str):
++        super().__init__(detail)
++        self.status_code = status_code
++        self.detail = detail
++
++def format_config_etag(version: int) -> str:
++    return f'"{version}"'
++
++def parse_config_etag(value: str) -> int:
++    etag = value.strip()
++    if len(etag) < 3 or not etag.startswith('"') or not etag.endswith('"'):
++        raise AgentConfigUpdateError(400, "If-Match must be a quoted config version")
++    version = etag[1:-1]
++    if not version.isdigit():
++        raise AgentConfigUpdateError(400, "If-Match must be a quoted config version")
++    return int(version)
++
++def update_agent_config(
++    registry: Any,
++    agent_id: str,
++    payload: Dict[str, Any],
++    if_match: Optional[str],
++) -> Dict[str, Any]:
++    if not isinstance(payload, dict):
++        raise AgentConfigUpdateError(400, "request body must be an object")
++    if "config" not in payload:
++        raise AgentConfigUpdateError(400, "config is required")
++    config = payload["config"]
++    if not isinstance(config, dict):
++        raise AgentConfigUpdateError(400, "config must be an object")
++    if if_match is None or not if_match.strip():
++        raise AgentConfigUpdateError(428, "If-Match header is required")
++
++    expected_version = parse_config_etag(if_match)
++    if not _valid_agent_id(agent_id):
++        raise AgentConfigUpdateError(400, "invalid agent_id")
++
++    agent = registry.get(agent_id)
++    if not agent:
++        raise AgentConfigUpdateError(404, "Agent not found")
++
++    current_version = int(agent.get("config_version", 1))
++    if expected_version != current_version:
++        raise AgentConfigUpdateError(412, "Stale agent config ETag")
++
++    next_version = current_version + 1
++    agent["config"] = dict(config)
++    agent["config_version"] = next_version
++    agent["updated_at"] = time.time()
++
++    return {
++        "agent_id": agent_id,
++        "config": dict(agent["config"]),
++        "etag": format_config_etag(next_version),
++    }
++
++def _valid_agent_id(agent_id: str) -> bool:
++    return bool(
++        isinstance(agent_id, str)
++        and agent_id
++        and ".." not in agent_id
++        and "/" not in agent_id
++        and "\\" not in agent_id
++    )
+diff --git a/src/api/routes.py b/src/api/routes.py
+index fae97d6..eb12b51 100644
+--- a/src/api/routes.py
++++ b/src/api/routes.py
+@@ -1,26 +1,25 @@
+ """API route definitions."""
+ 
+-from fastapi import APIRouter, HTTPException, Depends
++from fastapi import APIRouter, Header, HTTPException
++from fastapi.responses import JSONResponse
+ from typing import List, Dict, Optional
+ 
+ from src.agent import AgentRegistry, AgentStatus
++from src.api.agent_config import AgentConfigUpdateError, update_agent_config
+ 
+ router = APIRouter()
+ registry = AgentRegistry()
+ 
+-
+ @router.get("/agents")
+ async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+     status_filter = AgentStatus(status) if status else None
+     return {"agents": registry.list(status=status_filter, group=group)}
+ 
+-
+ @router.post("/agents")
+ async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+     agent_id = registry.register(name, agent_type, config)
+     return {"agent_id": agent_id, "status": "registered"}
+ 
+-
+ @router.get("/agents/{agent_id}")
+ async def get_agent(agent_id: str):
+     agent = registry.get(agent_id)
+@@ -28,6 +27,23 @@ async def get_agent(agent_id: str):
+         raise HTTPException(status_code=404, detail="Agent not found")
+     return agent
+ 
++@router.patch("/agents/{agent_id}/config")
++async def patch_agent_config(
++    agent_id: str,
++    payload: Dict,
++    if_match: Optional[str] = Header(None, alias="If-Match"),
++):
++    try:
++        result = update_agent_config(registry, agent_id, payload, if_match)
++    except AgentConfigUpdateError as exc:
++        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
++        
++    response = JSONResponse(
++        content={"agent_id": result["agent_id"], "config": result["config"]},
++        status_code=200,
++    )
++    response.headers["ETag"] = result["etag"]
++    return response
+ 
+ @router.delete("/agents/{agent_id}")
+ async def delete_agent(agent_id: str):
+@@ -35,21 +51,18 @@ async def delete_agent(agent_id: str):
+         raise HTTPException(status_code=404, detail="Agent not found")
+     return {"status": "deleted"}
+ 
+-
+ @router.post("/agents/{agent_id}/start")
+ async def start_agent(agent_id: str):
+     if not registry.update_status(agent_id, AgentStatus.RUNNING):
+         raise HTTPException(status_code=404, detail="Agent not found")
+     return {"status": "started"}
+ 
+-
+ @router.post("/agents/{agent_id}/stop")
+ async def stop_agent(agent_id: str):
+     if not registry.update_status(agent_id, AgentStatus.PAUSED):
+         raise HTTPException(status_code=404, detail="Agent not found")
+     return {"status": "stopped"}
+ 
+-
+ @router.get("/agents/count")
+ async def agent_count():
+     return {"count": registry.count()}
+diff --git a/tests/test_agent_config_etag.py b/tests/test_agent_config_etag.py
+new file mode 100644
+index 0000000..e54b431
+--- /dev/null
++++ b/tests/test_agent_config_etag.py
+@@ -0,0 +1,67 @@
++import pytest
++from fastapi.testclient import TestClient
++
++from src.agent import AgentRegistry
++from src.api import routes
++from src.api.agent_config import AgentConfigUpdateError, update_agent_config
++from src.api.server import create_app
++
++
++AUTH = {"Authorization": "Bearer test-token"}
++
++class LookupGuardRegistry:
++    def get(self, _agent_id):
++        raise AssertionError("registry lookup should not run")
++
++
++def make_client():
++    routes.registry = AgentRegistry()
++    return TestClient(create_app())
++
++
++def register_agent(config=None):
++    return routes.registry.register(
++        "test-agent",
++        "worker.processor",
++        config or {"retries": 1, "mode": "safe"},
++    )
++
++
++def test_authorized_config_update_returns_next_etag():
++    client = make_client()
++    agent_id = register_agent()
++
++    response = client.patch(
++        f"/api/v2/agents/{agent_id}/config",
++        headers={**AUTH, "If-Match": '"1"'},
++        json={"config": {"retries": 2}},
++    )
++
++    assert response.status_code == 200
++    assert response.headers["etag"] == '"2"'
++    assert response.json() == {"agent_id": agent_id, "config": {"retries": 2}}
++    assert routes.registry.get(agent_id)["config"] == {"retries": 2}
++    assert routes.registry.get(agent_id)["config_version"] == 2
++
++
++def test_stale_etag_cannot_overwrite_newer_agent_config():
++    client = make_client()
++    agent_id = register_agent()
++
++    first = client.patch(
++        f"/api/v2/agents/{agent_id}/config",
++        headers={**AUTH, "If-Match": '"1"'},
++        json={"config": {"retries": 2}},
++    )
++    assert first.status_code == 200
++
++    stale = client.patch(
++        f"/api/v2/agents/{agent_id}/config",
++        headers={**AUTH, "If-Match": '"1"'},
++        json={"config": {"retries": 99}},
++    )
++
++    assert stale.status_code == 412
++    assert stale.json()["detail"] == "Stale agent config ETag"
++    assert routes.registry.get(agent_id)["config"] == {"retries": 2}
++    assert routes.registry.get(agent_id)["config_version"] == 2
+-- 
+2.47.3
+

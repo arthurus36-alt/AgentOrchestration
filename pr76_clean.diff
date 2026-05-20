@@ -1,0 +1,346 @@
+diff --git a/src/orchestrator/workflow.py b/src/orchestrator/workflow.py
+index 6d853c12..bbf6a4a2 100644
+--- a/src/orchestrator/workflow.py
++++ b/src/orchestrator/workflow.py
+@@ -1,6 +1,7 @@
+ """Workflow Manager — Defines and executes multi-step agent workflows."""
+ 
+ from enum import Enum
++from inspect import Parameter, signature
+ from typing import Any, Callable, Dict, List, Optional
+ from uuid import uuid4
+ 
+@@ -13,16 +14,30 @@ class StepStatus(Enum):
+     SKIPPED = "skipped"
+ 
+ 
++class WorkflowStateError(RuntimeError):
++    """Raised when a workflow transition would violate lifecycle state."""
++
++
+ class WorkflowStep:
+-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
++    def __init__(
++        self,
++        name: str,
++        handler: Callable,
++        retries: int = 0,
++        timeout: int = 300,
++        compensate: Optional[Callable] = None,
++    ):
+         self.id = str(uuid4())
+         self.name = name
+         self.handler = handler
++        self.compensate = compensate
+         self.retries = retries
+         self.timeout = timeout
+         self.status = StepStatus.PENDING
+         self.result: Any = None
+         self.error: Optional[str] = None
++        self.compensation_status = "pending" if compensate else "skipped"
++        self.compensation_error: Optional[str] = None
+ 
+ 
+ class Workflow:
+@@ -33,8 +48,18 @@ def __init__(self, name: str, description: str = ""):
+         self.steps: List[WorkflowStep] = []
+         self._step_map: Dict[str, WorkflowStep] = {}
+         self.status = StepStatus.PENDING
++        self.audit_events: List[Dict[str, Any]] = []
++        self.metrics: Dict[str, int] = {
++            "compensation_failures": 0,
++            "downstream_blocks": 0,
++            "partial_rollback_blocks": 0,
++        }
+ 
+     def add_step(self, step: WorkflowStep) -> "Workflow":
++        if self.status != StepStatus.PENDING:
++            raise WorkflowStateError(
++                "cannot add steps after workflow dispatch"
++            )
+         self.steps.append(step)
+         self._step_map[step.id] = step
+         return self
+@@ -66,22 +91,149 @@ def execute_workflow(self, workflow_id: str) -> bool:
+         if not workflow:
+             return False
+ 
++        completed_steps: List[WorkflowStep] = []
+         workflow.status = StepStatus.RUNNING
+-        for step in workflow.steps:
++        for index, step in enumerate(workflow.steps):
+             step.status = StepStatus.RUNNING
+             try:
+                 result = step.handler()
+                 step.result = result
+                 step.status = StepStatus.COMPLETED
++                completed_steps.append(step)
+             except Exception as e:
+-                step.error = str(e)
++                step.error = e.__class__.__name__
+                 step.status = StepStatus.FAILED
++                rollback_failures = self._compensate_completed_steps(
++                    workflow,
++                    completed_steps,
++                )
++                self._block_downstream_steps(
++                    workflow,
++                    index + 1,
++                    step,
++                    e.__class__.__name__,
++                    rollback_failures,
++                )
+                 workflow.status = StepStatus.FAILED
+                 return False
+ 
+         workflow.status = StepStatus.COMPLETED
+         return True
+ 
++    def _compensate_completed_steps(
++        self,
++        workflow: Workflow,
++        completed_steps: List[WorkflowStep],
++    ) -> List[WorkflowStep]:
++        failed_steps: List[WorkflowStep] = []
++        for step in reversed(completed_steps):
++            compensate = getattr(step, "compensate", None)
++            if not compensate:
++                step.compensation_status = "skipped"
++                continue
++
++            step.compensation_status = "running"
++            try:
++                self._run_compensation(step, compensate)
++                step.compensation_status = "completed"
++                step.compensation_error = None
++            except Exception as exc:
++                step.compensation_status = "failed"
++                step.compensation_error = exc.__class__.__name__
++                failed_steps.append(step)
++                workflow.metrics["compensation_failures"] += 1
++                workflow.audit_events.append(
++                    {
++                        "event": "compensation_failed",
++                        "workflow_id": workflow.id,
++                        "step_id": step.id,
++                        "step_name": step.name,
++                        "error_type": exc.__class__.__name__,
++                    }
++                )
++        return failed_steps
++
++    def _run_compensation(
++        self,
++        step: WorkflowStep,
++        compensate: Callable,
++    ) -> None:
++        if self._compensation_accepts_result(compensate):
++            compensate(step.result)
++        else:
++            compensate()
++
++    def _compensation_accepts_result(self, compensate: Callable) -> bool:
++        try:
++            parameters = signature(compensate).parameters.values()
++        except (TypeError, ValueError):
++            return False
++
++        positional_kinds = {
++            Parameter.POSITIONAL_ONLY,
++            Parameter.POSITIONAL_OR_KEYWORD,
++            Parameter.VAR_POSITIONAL,
++        }
++        return any(
++            parameter.kind in positional_kinds
++            for parameter in parameters
++        )
++
++    def _block_downstream_steps(
++        self,
++        workflow: Workflow,
++        start_index: int,
++        failed_step: WorkflowStep,
++        failure_type: str,
++        rollback_failures: List[WorkflowStep],
++    ) -> None:
++        partial_rollback = bool(rollback_failures)
++        reason = (
++            "blocked_after_partial_rollback"
++            if partial_rollback
++            else "blocked_after_failure"
++        )
++        blocked_steps: List[WorkflowStep] = []
++        for step in workflow.steps[start_index:]:
++            if step.status != StepStatus.PENDING:
++                continue
++            step.status = StepStatus.SKIPPED
++            step.error = reason
++            blocked_steps.append(step)
++
++        if not blocked_steps:
++            return
++
++        workflow.metrics["downstream_blocks"] += len(blocked_steps)
++        if partial_rollback:
++            workflow.metrics["partial_rollback_blocks"] += 1
++
++        event = (
++            "downstream_blocked_after_partial_rollback"
++            if partial_rollback
++            else "downstream_blocked_after_failure"
++        )
++        workflow.audit_events.append(
++            {
++                "event": event,
++                "workflow_id": workflow.id,
++                "failed_step_id": failed_step.id,
++                "failed_step_name": failed_step.name,
++                "failure_type": failure_type,
++                "rollback_failed_step_ids": [
++                    step.id for step in rollback_failures
++                ],
++                "rollback_failed_step_names": [
++                    step.name for step in rollback_failures
++                ],
++                "blocked_step_ids": [step.id for step in blocked_steps],
++                "blocked_step_names": [step.name for step in blocked_steps],
++                "reason": (
++                    "partial_rollback" if partial_rollback else "failure"
++                ),
++            }
++        )
++
+ # 2019-03-27T19:58:07 update
+ 
+ # 2019-05-09T09:42:56 update
+diff --git a/tests/test_workflow_compensation.py b/tests/test_workflow_compensation.py
+new file mode 100644
+index 00000000..ba288897
+--- /dev/null
++++ b/tests/test_workflow_compensation.py
+@@ -0,0 +1,125 @@
++import pytest
++
++from src.orchestrator.workflow import (
++    StepStatus,
++    WorkflowManager,
++    WorkflowStep,
++)
++
++
++def test_partial_rollback_blocks_downstream_and_keeps_execution_state():
++    calls = []
++
++    def prepare():
++        calls.append("prepare")
++        return "prepared"
++
++    def fail_dispatch():
++        calls.append("dispatch")
++        raise RuntimeError("dispatch-secret-456")
++
++    def downstream():
++        calls.append("downstream")
++
++    def fail_compensation():
++        calls.append("undo-prepare")
++        raise RuntimeError("private-token-123")
++
++    manager = WorkflowManager()
++    workflow = manager.create_workflow("partial rollback")
++    prepare_step = WorkflowStep(
++        "prepare",
++        prepare,
++        compensate=fail_compensation,
++    )
++    dispatch_step = WorkflowStep("dispatch", fail_dispatch)
++    downstream_step = WorkflowStep("downstream", downstream)
++
++    workflow.add_step(prepare_step)
++    workflow.add_step(dispatch_step)
++    workflow.add_step(downstream_step)
++
++    assert manager.execute_workflow(workflow.id) is False
++
++    assert calls == ["prepare", "dispatch", "undo-prepare"]
++    assert workflow.status == StepStatus.FAILED
++    assert prepare_step.status == StepStatus.COMPLETED
++    assert prepare_step.compensation_status == "failed"
++    assert prepare_step.compensation_error == "RuntimeError"
++    assert dispatch_step.status == StepStatus.FAILED
++    assert dispatch_step.error == "RuntimeError"
++    assert downstream_step.status == StepStatus.SKIPPED
++    assert downstream_step.error == "blocked_after_partial_rollback"
++
++    block_events = [
++        event
++        for event in workflow.audit_events
++        if event["event"] == "downstream_blocked_after_partial_rollback"
++    ]
++    assert block_events == [
++        {
++            "event": "downstream_blocked_after_partial_rollback",
++            "workflow_id": workflow.id,
++            "failed_step_id": dispatch_step.id,
++            "failed_step_name": "dispatch",
++            "failure_type": "RuntimeError",
++            "rollback_failed_step_ids": [prepare_step.id],
++            "rollback_failed_step_names": ["prepare"],
++            "blocked_step_ids": [downstream_step.id],
++            "blocked_step_names": ["downstream"],
++            "reason": "partial_rollback",
++        }
++    ]
++    assert workflow.metrics["compensation_failures"] == 1
++    assert workflow.metrics["partial_rollback_blocks"] == 1
++
++    audit_blob = repr(workflow.audit_events)
++    assert "private-token-123" not in audit_blob
++    assert "dispatch-secret-456" not in audit_blob
++
++
++def test_workflow_rejects_late_step_registration_after_failed_dispatch():
++    manager = WorkflowManager()
++    workflow = manager.create_workflow("closed after dispatch")
++    workflow.add_step(
++        WorkflowStep(
++            "prepare",
++            lambda: "ok",
++            compensate=lambda: (_ for _ in ()).throw(RuntimeError("secret")),
++        )
++    )
++    workflow.add_step(
++        WorkflowStep(
++            "dispatch",
++            lambda: (_ for _ in ()).throw(RuntimeError("boom")),
++        )
++    )
++
++    assert manager.execute_workflow(workflow.id) is False
++
++    with pytest.raises(RuntimeError, match="cannot add steps"):
++        workflow.add_step(WorkflowStep("late downstream", lambda: "unsafe"))
++
++
++def test_compensation_can_receive_completed_step_result():
++    calls = []
++    manager = WorkflowManager()
++    workflow = manager.create_workflow("result aware rollback")
++    compensated_step = WorkflowStep(
++        "reserve",
++        lambda: "reservation-id",
++        compensate=lambda result: calls.append(f"undo:{result}"),
++    )
++    workflow.add_step(compensated_step)
++    workflow.add_step(
++        WorkflowStep(
++            "dispatch",
++            lambda: (_ for _ in ()).throw(RuntimeError("stop")),
++        )
++    )
++
++    assert manager.execute_workflow(workflow.id) is False
++
++    assert calls == ["undo:reservation-id"]
++    assert compensated_step.status == StepStatus.COMPLETED
++    assert compensated_step.compensation_status == "completed"

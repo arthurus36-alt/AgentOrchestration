@@ -1,0 +1,191 @@
+From cc9db124f1c81daa271f0b2fe3abc305a84d38e2 Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 01:17:24 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#141:=20Make=20dead-letter=20writes=20ide?=
+ =?UTF-8?q?mpotent=20=E2=80=94=20acknowledgement=20retries?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/orchestrator/scheduler.py       | 103 +++++++++++++++++-----------
+ tests/test_scheduler_dead_letter.py |  50 ++++++++++++++
+ 2 files changed, 112 insertions(+), 41 deletions(-)
+ create mode 100644 tests/test_scheduler_dead_letter.py
+
+diff --git a/src/orchestrator/scheduler.py b/src/orchestrator/scheduler.py
+index 2dbb1f5..496fb32 100644
+--- a/src/orchestrator/scheduler.py
++++ b/src/orchestrator/scheduler.py
+@@ -197,50 +197,71 @@ class TaskScheduler:
+         return True
+ 
+     def fail(self, task_id: str, queue: str = "default") -> bool:
+-        task = self._in_flight.pop(task_id, None)
+-        if task:
+-            task["retries"] += 1
+-            task["run_state"] = RunState.IN_PROGRESS.name
+-            if task["retries"] >= self._max_retries:
+-                if not self._is_already_terminal(task_id):
+-                    self._set_terminal_outcome(task_id, RunState.TERMINAL_FAILURE.value)
+-                original_queue = self._task_queues.pop(task_id, queue)
+-                self._release_capacity(original_queue, task_id)
+-                self._record_audit("task_failed_terminal", task_id, original_queue)
+-                return False
+-
+-            original_queue = self._task_queues.get(task_id, queue)
+-            transfer_reserved = False
+-            try:
+-                if queue != original_queue:
++        task = self._in_flight.get(task_id)
++        if not task:
++            if self._is_already_terminal(task_id) and self._terminal_outcomes.get(task_id) == RunState.TERMINAL_FAILURE.value:
++                self._record_audit("dead_letter_idempotent", task_id, queue)
++            return False
++
++        task["retries"] += 1
++        task["run_state"] = RunState.IN_PROGRESS.name
++        original_queue = self._task_queues.get(task_id, queue)
++
++        if task["retries"] >= self._max_retries:
++            task = self._in_flight.pop(task_id)
++            if not self._is_already_terminal(task_id):
++                self._set_terminal_outcome(task_id, RunState.TERMINAL_FAILURE.value)
++            
++            if queue != original_queue and queue != "default":
++                try:
+                     self._reserve_capacity(queue, task_id)
+-                    transfer_reserved = True
+-                self._push_queued_task(
+-                    task,
+-                    queue,
+-                    task.get("priority", 0),
+-                )
+-            except Exception as exc:
+-                if transfer_reserved:
++                    self._push_queued_task(task, queue, priority=task.get("priority", 0))
++                except Exception as exc:
+                     self._release_capacity(queue, task_id)
+-                task["retries"] -= 1
+-                self._in_flight[task_id] = task
+-                self._task_queues[task_id] = original_queue
+-                self._record_audit(
+-                    "retry_enqueue_rolled_back",
+-                    task_id,
+-                    queue,
+-                    type(exc).__name__,
+-                )
+-                metrics.increment("scheduler.enqueue.rollback")
+-                raise
++                    self._record_audit("dead_letter_write_failed", task_id, queue, type(exc).__name__)
++                    self._terminal_outcomes.pop(task_id, None)
++                    task["retries"] -= 1
++                    self._in_flight[task_id] = task
++                    raise
++                self._task_queues[task_id] = queue
++            
++            self._task_queues.pop(task_id, None)
++            self._release_capacity(original_queue, task_id)
++            self._record_audit("task_failed_terminal", task_id, original_queue)
++            return False
++
++        task = self._in_flight.pop(task_id)
++        transfer_reserved = False
++        try:
++            if queue != original_queue:
++                self._reserve_capacity(queue, task_id)
++                transfer_reserved = True
++            self._push_queued_task(
++                task,
++                queue,
++                task.get("priority", 0),
++            )
++        except Exception as exc:
+             if transfer_reserved:
+-                self._release_capacity(original_queue, task_id)
+-            self._task_queues[task_id] = queue
+-            self._record_audit("retry_enqueued", task_id, queue)
+-            metrics.increment("scheduler.retry.enqueued")
+-            return True
+-        return False
++                self._release_capacity(queue, task_id)
++            task["retries"] -= 1
++            self._in_flight[task_id] = task
++            self._task_queues[task_id] = original_queue
++            self._record_audit(
++                "retry_enqueue_rolled_back",
++                task_id,
++                queue,
++                type(exc).__name__,
++            )
++            metrics.increment("scheduler.enqueue.rollback")
++            raise
++            
++        if transfer_reserved:
++            self._release_capacity(original_queue, task_id)
++        self._task_queues[task_id] = queue
++        self._record_audit("retry_enqueued", task_id, queue)
++        metrics.increment("scheduler.retry.enqueued")
++        return True
+ 
+ # 2019-04-25T08:37:12 update
+ 
+diff --git a/tests/test_scheduler_dead_letter.py b/tests/test_scheduler_dead_letter.py
+new file mode 100644
+index 0000000..9b7c82e
+--- /dev/null
++++ b/tests/test_scheduler_dead_letter.py
+@@ -0,0 +1,50 @@
++import asyncio
++import pytest
++from src.orchestrator.scheduler import TaskScheduler, PriorityQueue
++
++class TestTaskSchedulerDeadLetterIdempotent:
++    def test_dead_letter_write_idempotent(self):
++        scheduler = TaskScheduler()
++        task = {"type": "test", "retries": 2}
++        task_id = scheduler.enqueue(task)
++        
++        dequeued = asyncio.run(scheduler.dequeue())
++        assert dequeued["id"] == task_id
++        
++        # Will reach 3 retries and be pushed to dead queue explicitly or implicitly
++        # fail() returns False when terminal
++        assert scheduler.fail(task_id, queue="dead") is False
++        
++        # Verify it's marked terminal
++        assert scheduler._is_already_terminal(task_id)
++        
++        # Verify idempotent acknowledgement (calling fail again)
++        assert scheduler.fail(task_id, queue="dead") is False
++        
++        audit = scheduler.audit_log()
++        assert audit[-1]["decision"] == "dead_letter_idempotent"
++
++    def test_dead_letter_write_failure_rollback(self, monkeypatch):
++        scheduler = TaskScheduler(queue_capacities={"default": 1, "dead": 1})
++        task = {"type": "test", "retries": 2}
++        task_id = scheduler.enqueue(task)
++        dequeued = asyncio.run(scheduler.dequeue())
++        
++        dead_queue = PriorityQueue()
++        def fail_push(_task, priority=0):
++            raise RuntimeError("dead letter store full")
++            
++        monkeypatch.setattr(dead_queue, "push", fail_push)
++        scheduler._queues["dead"] = dead_queue
++        
++        with pytest.raises(RuntimeError, match="dead letter store full"):
++            # Because it evaluates retries = 3 and then attempts to enqueue to "dead",
++            # raising the exception
++            scheduler.fail(task_id, queue="dead")
++            
++        # Verify rollback preserved in-flight and capacity
++        assert task_id in scheduler._in_flight
++        assert scheduler._in_flight[task_id]["retries"] == 2
++        assert not scheduler._is_already_terminal(task_id)
++        
++        assert scheduler.capacity_snapshot()["default"]["used"] == 1
+-- 
+2.47.3
+

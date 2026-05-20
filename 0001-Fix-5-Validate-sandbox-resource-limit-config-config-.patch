@@ -1,0 +1,112 @@
+From 787fe66e4ab9d2ac2e3bacd4832f4b1cb833e2c0 Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 04:57:45 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#5:=20Validate=20sandbox=20resource=20lim?=
+ =?UTF-8?q?it=20config=20=E2=80=94=20config-to-sandbox=20boundary?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/agent/sandbox.py         | 40 +++++++++++++++++++++++++++---------
+ tests/test_sandbox_limits.py | 24 ++++++++++++++++++++++
+ 2 files changed, 54 insertions(+), 10 deletions(-)
+ create mode 100644 tests/test_sandbox_limits.py
+
+diff --git a/src/agent/sandbox.py b/src/agent/sandbox.py
+index c6ad696..7d33269 100644
+--- a/src/agent/sandbox.py
++++ b/src/agent/sandbox.py
+@@ -2,16 +2,35 @@
+ 
+ import os
+ import tempfile
+-import resource
+ from typing import Dict, Optional
+ from pathlib import Path
+ 
++try:
++    import resource
++except ImportError:
++    resource = None
++
++
++class ResourceLimitsError(Exception):
++    """Raised when resource limits are invalid."""
++    pass
++
+ 
+ class ResourceLimits:
+     def __init__(self, cpu_time: int = 60, memory_mb: int = 512, disk_mb: int = 100):
+-        self.cpu_time = cpu_time
+-        self.memory_mb = memory_mb
+-        self.disk_mb = disk_mb
++        try:
++            self.cpu_time = int(cpu_time)
++            self.memory_mb = int(memory_mb)
++            self.disk_mb = int(disk_mb)
++        except (ValueError, TypeError):
++            raise ResourceLimitsError("Resource limits must be numeric values")
++            
++        if self.cpu_time <= 0:
++            raise ResourceLimitsError(f"cpu_time must be positive, got {self.cpu_time}")
++        if self.memory_mb <= 0:
++            raise ResourceLimitsError(f"memory_mb must be positive, got {self.memory_mb}")
++        if self.disk_mb <= 0:
++            raise ResourceLimitsError(f"disk_mb must be positive, got {self.disk_mb}")
+ 
+ 
+ class AgentSandbox:
+@@ -37,12 +56,13 @@ class AgentSandbox:
+         return self._sandboxes.get(agent_id)
+ 
+     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
+-        try:
+-            resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
+-            mem_bytes = limits.memory_mb * 1024 * 1024
+-            resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+-        except (ValueError, resource.error) as e:
+-            pass
++        if resource:
++            try:
++                resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
++                mem_bytes = limits.memory_mb * 1024 * 1024
++                resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
++            except (ValueError, resource.error) as e:
++                pass
+ 
+     def cleanup_all(self) -> None:
+         for agent_id in list(self._sandboxes.keys()):
+diff --git a/tests/test_sandbox_limits.py b/tests/test_sandbox_limits.py
+new file mode 100644
+index 0000000..c41f331
+--- /dev/null
++++ b/tests/test_sandbox_limits.py
+@@ -0,0 +1,24 @@
++import pytest
++from src.agent.sandbox import ResourceLimits, ResourceLimitsError
++
++class TestResourceLimits:
++    def test_valid_limits(self):
++        limits = ResourceLimits(cpu_time=120, memory_mb=1024, disk_mb=500)
++        assert limits.cpu_time == 120
++        assert limits.memory_mb == 1024
++        assert limits.disk_mb == 500
++
++    def test_string_conversion(self):
++        limits = ResourceLimits(cpu_time="120", memory_mb="1024", disk_mb="500")
++        assert limits.cpu_time == 120
++
++    def test_non_numeric_raises_error(self):
++        with pytest.raises(ResourceLimitsError, match="must be numeric"):
++            ResourceLimits(cpu_time="invalid")
++
++    def test_negative_values_raise_error(self):
++        with pytest.raises(ResourceLimitsError, match="must be positive"):
++            ResourceLimits(cpu_time=-1)
++            
++        with pytest.raises(ResourceLimitsError, match="must be positive"):
++            ResourceLimits(memory_mb=0)
+-- 
+2.47.3
+

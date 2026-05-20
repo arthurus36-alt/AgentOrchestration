@@ -1,0 +1,394 @@
+diff --git a/src/orchestrator/scheduler.py b/src/orchestrator/scheduler.py
+index db2f3606..95141dc4 100644
+--- a/src/orchestrator/scheduler.py
++++ b/src/orchestrator/scheduler.py
+@@ -1,11 +1,16 @@
+ """Task Scheduler — Priority-based task queuing and dispatch."""
+ 
+-import asyncio
+ import heapq
+ import time
+-from typing import Any, Dict, Optional
++from typing import Any, Dict, List, Optional, Set
+ from uuid import uuid4
+ 
++from src.common.metrics import metrics
++
++
++class QueueCapacityExceeded(RuntimeError):
++    """Raised when a queue has no available scheduler capacity."""
++
+ 
+ class PriorityQueue:
+     def __init__(self):
+@@ -31,30 +36,71 @@ def __len__(self) -> int:
+ 
+ 
+ class TaskScheduler:
+-    def __init__(self):
++    def __init__(self, queue_capacities: Optional[Dict[str, int]] = None):
+         self._queues: Dict[str, PriorityQueue] = {}
+         self._scheduled: Dict[str, float] = {}
+         self._in_flight: Dict[str, Dict] = {}
++        self._task_queues: Dict[str, str] = {}
++        self._capacity_claims: Dict[str, Set[str]] = {}
++        self._queue_capacities = queue_capacities or {}
++        self._audit_log: List[Dict[str, Any]] = []
+         self._max_retries = 3
+ 
+-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
++    def enqueue(
++        self,
++        task: Dict,
++        queue: str = "default",
++        priority: int = 0,
++    ) -> str:
+         task_id = str(uuid4())
+-        task["id"] = task_id
+-        task["enqueued_at"] = time.time()
+-        task["retries"] = 0
++        queued_task = dict(task)
++        queued_task["id"] = task_id
++        queued_task["enqueued_at"] = time.time()
++        queued_task["retries"] = 0
++        queued_task["priority"] = priority
++
++        self._reserve_capacity(queue, task_id)
++        try:
++            self._push_queued_task(queued_task, queue, priority)
++        except Exception as exc:
++            self._release_capacity(queue, task_id)
++            self._record_audit(
++                "enqueue_rolled_back",
++                task_id,
++                queue,
++                type(exc).__name__,
++            )
++            metrics.increment("scheduler.enqueue.rollback")
++            raise
++
++        task.update(queued_task)
++        self._task_queues[task_id] = queue
++        self._record_audit("enqueue_committed", task_id, queue)
++        metrics.increment("scheduler.enqueue.committed")
++        return task_id
+ 
++    def _push_queued_task(self, task: Dict, queue: str, priority: int) -> None:
+         if queue not in self._queues:
+             self._queues[queue] = PriorityQueue()
+         self._queues[queue].push(task, priority)
+-        return task_id
+ 
+-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
++    def schedule(
++        self,
++        task: Dict,
++        delay: float,
++        queue: str = "default",
++        priority: int = 0,
++    ) -> str:
+         task_id = str(uuid4())
+         task["id"] = task_id
+         self._scheduled[task_id] = time.time() + delay
+         return task_id
+ 
+-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
++    async def dequeue(
++        self,
++        queue: str = "default",
++        timeout: float = 1.0,
++    ) -> Optional[Dict]:
+         now = time.time()
+         expired = [tid for tid, t in self._scheduled.items() if t <= now]
+         for tid in expired:
+@@ -66,21 +112,108 @@ async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optiona
+             task = self._queues[queue].pop()
+             if task:
+                 self._in_flight[task["id"]] = task
++                self._task_queues[task["id"]] = queue
+                 return task
+         return None
+ 
+     def complete(self, task_id: str) -> bool:
+-        return self._in_flight.pop(task_id, None) is not None
++        task = self._in_flight.pop(task_id, None)
++        if task is None:
++            return False
++        queue = self._task_queues.pop(task_id, task.get("queue", "default"))
++        self._release_capacity(queue, task_id)
++        self._record_audit("task_completed", task_id, queue)
++        metrics.increment("scheduler.task.completed")
++        return True
+ 
+     def fail(self, task_id: str, queue: str = "default") -> bool:
+         task = self._in_flight.pop(task_id, None)
+         if task:
+             task["retries"] += 1
+             if task["retries"] < self._max_retries:
+-                self.enqueue(task, queue, priority=task.get("priority", 0))
++                original_queue = self._task_queues.get(task_id, queue)
++                transfer_reserved = False
++                try:
++                    if queue != original_queue:
++                        self._reserve_capacity(queue, task_id)
++                        transfer_reserved = True
++                    self._push_queued_task(
++                        task,
++                        queue,
++                        task.get("priority", 0),
++                    )
++                except Exception as exc:
++                    if transfer_reserved:
++                        self._release_capacity(queue, task_id)
++                    task["retries"] -= 1
++                    self._in_flight[task_id] = task
++                    self._task_queues[task_id] = original_queue
++                    self._record_audit(
++                        "retry_enqueue_rolled_back",
++                        task_id,
++                        queue,
++                        type(exc).__name__,
++                    )
++                    metrics.increment("scheduler.enqueue.rollback")
++                    raise
++                if transfer_reserved:
++                    self._release_capacity(original_queue, task_id)
++                self._task_queues[task_id] = queue
++                self._record_audit("retry_enqueued", task_id, queue)
++                metrics.increment("scheduler.retry.enqueued")
+                 return True
++            original_queue = self._task_queues.pop(task_id, queue)
++            self._release_capacity(original_queue, task_id)
++            self._record_audit("task_failed_terminal", task_id, original_queue)
+         return False
+ 
++    def capacity_snapshot(self) -> Dict[str, Dict[str, Optional[int]]]:
++        queues = set(self._queue_capacities) | set(self._capacity_claims)
++        return {
++            queue: {
++                "used": len(self._capacity_claims.get(queue, set())),
++                "limit": self._queue_capacities.get(queue),
++            }
++            for queue in sorted(queues)
++        }
++
++    def audit_log(self) -> List[Dict[str, Any]]:
++        return list(self._audit_log)
++
++    def _reserve_capacity(self, queue: str, task_id: str) -> None:
++        claims = self._capacity_claims.setdefault(queue, set())
++        limit = self._queue_capacities.get(queue)
++        if limit is not None and len(claims) >= limit:
++            self._record_audit("enqueue_rejected_capacity", task_id, queue)
++            metrics.increment("scheduler.enqueue.capacity_rejected")
++            raise QueueCapacityExceeded(
++                f"Queue {queue!r} has reached capacity"
++            )
++        claims.add(task_id)
++
++    def _release_capacity(self, queue: str, task_id: str) -> None:
++        claims = self._capacity_claims.get(queue)
++        if not claims:
++            return
++        claims.discard(task_id)
++
++    def _record_audit(
++        self,
++        decision: str,
++        task_id: str,
++        queue: str,
++        reason: Optional[str] = None,
++    ) -> None:
++        entry: Dict[str, Any] = {
++            "decision": decision,
++            "task_id": task_id,
++            "queue": queue,
++            "timestamp": time.time(),
++        }
++        if reason:
++            entry["reason"] = reason
++        self._audit_log.append(entry)
++
+ # 2019-04-25T08:37:12 update
+ 
+ # 2019-06-04T16:40:00 update
+diff --git a/tests/test_metrics.py b/tests/test_metrics.py
+index 383e5fc4..e73dffef 100644
+--- a/tests/test_metrics.py
++++ b/tests/test_metrics.py
+@@ -1,4 +1,3 @@
+-import pytest
+ from src.common.metrics import MetricsCollector
+ 
+ 
+diff --git a/tests/test_scheduler.py b/tests/test_scheduler.py
+index 538d23b8..1f0e3893 100644
+--- a/tests/test_scheduler.py
++++ b/tests/test_scheduler.py
+@@ -1,5 +1,11 @@
++import asyncio
++
+ import pytest
+-from src.orchestrator.scheduler import TaskScheduler
++from src.orchestrator.scheduler import (
++    PriorityQueue,
++    QueueCapacityExceeded,
++    TaskScheduler,
++)
+ 
+ 
+ class TestTaskScheduler:
+@@ -12,7 +18,6 @@ def test_enqueue_task(self):
+ 
+     def test_dequeue_task(self):
+         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
+-        import asyncio
+         task = asyncio.run(self.scheduler.dequeue())
+         assert task is not None
+         assert task["type"] == "test"
+@@ -20,22 +25,142 @@ def test_dequeue_task(self):
+     def test_enqueue_multiple_priorities(self):
+         self.scheduler.enqueue({"type": "low"}, priority=1)
+         self.scheduler.enqueue({"type": "high"}, priority=10)
+-        import asyncio
+         task = asyncio.run(self.scheduler.dequeue())
+         assert task["type"] == "high"
+ 
+     def test_complete_task(self):
+         self.scheduler.enqueue({"type": "test"})
+-        import asyncio
+         task = asyncio.run(self.scheduler.dequeue())
+         assert self.scheduler.complete(task["id"])
+ 
+     def test_fail_task_with_retry(self):
+         self.scheduler.enqueue({"type": "test"})
+-        import asyncio
+         task = asyncio.run(self.scheduler.dequeue())
+         assert self.scheduler.fail(task["id"])
+ 
++    def test_enqueue_rollback_releases_capacity(self, monkeypatch):
++        scheduler = TaskScheduler(queue_capacities={"default": 1})
++        queue = PriorityQueue()
++
++        def fail_push(_task, priority=0):
++            raise RuntimeError("transaction failed")
++
++        monkeypatch.setattr(queue, "push", fail_push)
++        scheduler._queues["default"] = queue
++        original_task = {"type": "rollback", "payload": {"private": "secret"}}
++
++        with pytest.raises(RuntimeError):
++            scheduler.enqueue(original_task)
++
++        assert original_task == {
++            "type": "rollback",
++            "payload": {"private": "secret"},
++        }
++        assert scheduler.capacity_snapshot()["default"] == {
++            "used": 0,
++            "limit": 1,
++        }
++        audit = scheduler.audit_log()
++        assert audit[-1]["decision"] == "enqueue_rolled_back"
++        assert audit[-1]["reason"] == "RuntimeError"
++        assert "payload" not in audit[-1]
++        assert "secret" not in str(audit[-1])
++
++        scheduler._queues["default"] = PriorityQueue()
++        task_id = scheduler.enqueue({"type": "accepted"})
++        assert task_id is not None
++        assert scheduler.capacity_snapshot()["default"] == {
++            "used": 1,
++            "limit": 1,
++        }
++
++    def test_capacity_rejects_until_complete_releases_claim(self):
++        scheduler = TaskScheduler(queue_capacities={"default": 1})
++        first_id = scheduler.enqueue({"type": "first"})
++
++        with pytest.raises(QueueCapacityExceeded):
++            scheduler.enqueue({"type": "second"})
++
++        first_task = asyncio.run(scheduler.dequeue())
++        assert first_task["id"] == first_id
++        assert scheduler.complete(first_id)
++        assert scheduler.capacity_snapshot()["default"] == {
++            "used": 0,
++            "limit": 1,
++        }
++
++        second_id = scheduler.enqueue({"type": "second"})
++        assert second_id is not None
++
++    def test_retry_preserves_capacity_and_task_id(self):
++        scheduler = TaskScheduler(queue_capacities={"default": 1})
++        task_id = scheduler.enqueue({"type": "retryable"}, priority=4)
++
++        task = asyncio.run(scheduler.dequeue())
++        assert scheduler.fail(task["id"])
++        assert scheduler.capacity_snapshot()["default"] == {
++            "used": 1,
++            "limit": 1,
++        }
++
++        retried = asyncio.run(scheduler.dequeue())
++        assert retried["id"] == task_id
++        assert retried["retries"] == 1
++
++    def test_retry_rollback_keeps_in_flight_state(self, monkeypatch):
++        scheduler = TaskScheduler(queue_capacities={"default": 1, "dead": 1})
++        task_id = scheduler.enqueue({"type": "retryable"}, priority=4)
++        task = asyncio.run(scheduler.dequeue())
++        dead_queue = PriorityQueue()
++
++        def fail_push(_task, priority=0):
++            raise RuntimeError("retry transaction failed")
++
++        monkeypatch.setattr(dead_queue, "push", fail_push)
++        scheduler._queues["dead"] = dead_queue
++
++        with pytest.raises(RuntimeError):
++            scheduler.fail(task["id"], queue="dead")
++
++        assert task["retries"] == 0
++        assert scheduler.capacity_snapshot()["default"] == {
++            "used": 1,
++            "limit": 1,
++        }
++        assert scheduler.capacity_snapshot()["dead"] == {
++            "used": 0,
++            "limit": 1,
++        }
++        assert scheduler.complete(task_id)
++        assert scheduler.capacity_snapshot()["default"]["used"] == 0
++        audit = scheduler.audit_log()
++        assert audit[-1]["decision"] == "task_completed"
++        assert any(
++            entry["decision"] == "retry_enqueue_rolled_back"
++            and entry["reason"] == "RuntimeError"
++            for entry in audit
++        )
++
++    def test_retry_to_new_queue_transfers_capacity_claim(self):
++        scheduler = TaskScheduler(queue_capacities={"default": 1, "dead": 1})
++        task_id = scheduler.enqueue({"type": "retryable"}, priority=4)
++        task = asyncio.run(scheduler.dequeue())
++
++        assert scheduler.fail(task["id"], queue="dead")
++        assert scheduler.capacity_snapshot()["default"] == {
++            "used": 0,
++            "limit": 1,
++        }
++        assert scheduler.capacity_snapshot()["dead"] == {
++            "used": 1,
++            "limit": 1,
++        }
++
++        retried = asyncio.run(scheduler.dequeue("dead"))
++        assert retried["id"] == task_id
++        assert scheduler.complete(task_id)
++        assert scheduler.capacity_snapshot()["dead"]["used"] == 0
++
+ # 2019-01-09T19:07:03 update
+ 
+ # 2019-02-18T12:30:02 update

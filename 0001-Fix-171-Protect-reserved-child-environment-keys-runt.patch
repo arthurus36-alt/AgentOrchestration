@@ -1,0 +1,78 @@
+From 47686784b70662b2e9ab777491247faecdb9ac72 Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 02:48:12 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#171:=20Protect=20reserved=20child=20envi?=
+ =?UTF-8?q?ronment=20keys=20=E2=80=94=20runtime=20env=20handling?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/agent/runtime.py      |  6 ++++--
+ tests/test_runtime_env.py | 23 +++++++++++++++++++++++
+ 2 files changed, 27 insertions(+), 2 deletions(-)
+ create mode 100644 tests/test_runtime_env.py
+
+diff --git a/src/agent/runtime.py b/src/agent/runtime.py
+index 53d6f1a..d169898 100644
+--- a/src/agent/runtime.py
++++ b/src/agent/runtime.py
+@@ -9,7 +9,6 @@ from typing import Dict, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
+-
+ class RuntimeState(Enum):
+     STOPPED = "stopped"
+     STARTING = "starting"
+@@ -17,7 +16,6 @@ class RuntimeState(Enum):
+     STOPPING = "stopping"
+     CRASHED = "crashed"
+ 
+-
+ class AgentRuntime:
+     def __init__(self):
+         self._processes: Dict[str, subprocess.Popen] = {}
+@@ -28,6 +26,10 @@ class AgentRuntime:
+             logger.warning(f"Agent {agent_id} is already running")
+             return False
+ 
++        if env and "AO_AGENT_ID" in env:
++            logger.error(f"Failed to start agent {agent_id}: cannot override reserved env var AO_AGENT_ID")
++            return False
++
+         self._states[agent_id] = RuntimeState.STARTING
+         process_env = os.environ.copy()
+         if env:
+diff --git a/tests/test_runtime_env.py b/tests/test_runtime_env.py
+new file mode 100644
+index 0000000..b86808d
+--- /dev/null
++++ b/tests/test_runtime_env.py
+@@ -0,0 +1,23 @@
++import pytest
++from src.agent.runtime import AgentRuntime, RuntimeState
++
++def test_start_rejects_reserved_env_keys(monkeypatch):
++    runtime = AgentRuntime()
++    
++    # Normally this would be a command, we mock subprocess to just assert failure
++    class MockPopen:
++        def __init__(self, *args, **kwargs):
++            self.pid = 1234
++        def poll(self):
++            return None
++            
++    monkeypatch.setattr("subprocess.Popen", MockPopen)
++    
++    success = runtime.start(
++        agent_id="agent-xyz", 
++        command=["echo", "test"], 
++        env={"AO_AGENT_ID": "malicious-id", "OTHER_VAR": "value"}
++    )
++    
++    assert success is False
++    assert runtime.get_state("agent-xyz") == RuntimeState.STOPPED
+-- 
+2.47.3
+

@@ -1,0 +1,100 @@
+From df4c2ca1df86dba0f6c260f4891a0bc8126b18bf Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 04:51:22 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#6:=20Reject=20unsupported=20output=20mod?=
+ =?UTF-8?q?es=20=E2=80=94=20argument=20validation?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/cli/main.py          | 20 +++++++++++++-------
+ tests/test_cli_output.py | 18 ++++++++++++++++++
+ 2 files changed, 31 insertions(+), 7 deletions(-)
+ create mode 100644 tests/test_cli_output.py
+
+diff --git a/src/cli/main.py b/src/cli/main.py
+index 0c839a4..962926d 100644
+--- a/src/cli/main.py
++++ b/src/cli/main.py
+@@ -6,8 +6,6 @@ import sys
+ from src.common.config import Config
+ from src.common.logging import configure_logging
+ 
+-
+-
+ def handle_init(args):
+     print(f"Initializing project: {args.name}")
+     return 0
+@@ -28,10 +26,17 @@ def handle_logs(args):
+     print(f"Fetching logs for agent: {args.agent_id}")
+     return 0
+ 
+-def cli():
++def cli(test_args=None):
+     parser = argparse.ArgumentParser(description="Agent Orchestrator CLI")
+     parser.add_argument("--config", "-c", help="Path to config file")
+     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
++    parser.add_argument(
++        "--output-mode", 
++        "-o", 
++        choices=["json", "text", "yaml", "table"], 
++        default="text", 
++        help="Format of the output"
++    )
+ 
+     subparsers = parser.add_subparsers(dest="command", help="Available commands")
+ 
+@@ -52,7 +57,7 @@ def cli():
+     logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
+     logs_parser.set_defaults(func=handle_logs)
+ 
+-    args = parser.parse_args()
++    args = parser.parse_args(test_args)
+ 
+     if args.verbose:
+         configure_logging("DEBUG")
+@@ -60,12 +65,13 @@ def cli():
+         configure_logging("INFO")
+ 
+     if hasattr(args, 'func'):
+-        sys.exit(args.func(args))
++        return args.func(args)
+     else:
+         parser.print_help()
+-        sys.exit(1)
++        return 1
++
+ if __name__ == "__main__":
+-    cli()
++    sys.exit(cli())
+ 
+ # 2019-01-03T18:44:00 update
+ 
+diff --git a/tests/test_cli_output.py b/tests/test_cli_output.py
+new file mode 100644
+index 0000000..d701f84
+--- /dev/null
++++ b/tests/test_cli_output.py
+@@ -0,0 +1,18 @@
++import pytest
++import sys
++from src.cli.main import cli
++
++def test_cli_rejects_unsupported_output_mode(capsys):
++    with pytest.raises(SystemExit) as exc_info:
++        cli(["--output-mode", "xml", "status"])
++    
++    assert exc_info.value.code != 0
++    captured = capsys.readouterr()
++    assert "invalid choice: 'xml'" in captured.err
++
++def test_cli_accepts_supported_output_mode():
++    try:
++        res = cli(["--output-mode", "json", "status"])
++        assert res == 0
++    except SystemExit:
++        pytest.fail("cli() raised SystemExit unexpectedly")
+-- 
+2.47.3
+

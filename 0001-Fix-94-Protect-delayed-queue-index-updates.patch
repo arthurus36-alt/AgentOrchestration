@@ -1,0 +1,274 @@
+From 5e46dfd8be27f0b3046021f791f19d2c5d928dcc Mon Sep 17 00:00:00 2001
+From: Bot <bot@example.com>
+Date: Wed, 20 May 2026 00:17:39 +0000
+Subject: [PATCH] Fix #94: Protect delayed queue index updates
+
+---
+ src/orchestrator/scheduler.py      | 122 ++++++++++++++++++++++++++---
+ tests/test_scheduler_reschedule.py |  74 +++++++++++++++++
+ 2 files changed, 183 insertions(+), 13 deletions(-)
+ create mode 100644 tests/test_scheduler_reschedule.py
+
+diff --git a/src/orchestrator/scheduler.py b/src/orchestrator/scheduler.py
+index e5d79d0..a5d7f0d 100644
+--- a/src/orchestrator/scheduler.py
++++ b/src/orchestrator/scheduler.py
+@@ -2,10 +2,13 @@
+ 
+ import asyncio
+ import heapq
++import logging
+ import time
+ from typing import Any, Dict, Optional
+ from uuid import uuid4
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ class PriorityQueue:
+     def __init__(self):
+@@ -33,19 +36,49 @@ class PriorityQueue:
+ class TaskScheduler:
+     def __init__(self):
+         self._queues: Dict[str, PriorityQueue] = {}
+-        self._scheduled: Dict[str, float] = {}
++        self._scheduled: Dict[str, Dict] = {}
+         self._in_flight: Dict[str, Dict] = {}
++        self._lifecycle: Dict[str, str] = {}
++        self._revisions: Dict[str, int] = {}
++        self._tasks: Dict[str, Dict] = {}
++        self._audit_records: list = []
+         self._max_retries = 3
+ 
+-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
++    def _bump_revision(self, task_id: str) -> None:
++        self._revisions[task_id] = self._revisions.get(task_id, 0) + 1
++
++    def _check_revision(self, task_id: str, expected: int) -> None:
++        if task_id in self._revisions and self._revisions[task_id] != expected:
++            actual = self._revisions[task_id]
++            logger.warning(f"Reconcile guard rejected transition for task {task_id}: revision mismatch (expected {expected}, actual {actual})")
++            raise ValueError(f"Revision mismatch for task {task_id}: expected {expected}, got {actual}")
++
++    def _check_lifecycle(self, task_id: str, valid_states: list) -> None:
++        state = self._lifecycle.get(task_id)
++        if state not in valid_states:
++            logger.warning(f"Reconcile guard rejected transition for task {task_id}: invalid lifecycle {state}")
++            raise ValueError(f"Invalid lifecycle transition for task {task_id}: current state is {state}, expected one of {valid_states}")
++
++    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0, revision: int = -1) -> str:
+         if "id" not in task:
+             task["id"] = str(uuid4())
++        task_id = task["id"]
++        
++        if revision != -1:
++            self._check_revision(task_id, revision)
++            
++        if task_id in self._lifecycle:
++            self._check_lifecycle(task_id, ["scheduled", "dispatched", "failed"])
++
+         if "enqueued_at" not in task:
+             task["enqueued_at"] = time.time()
+         if "retries" not in task:
+             task["retries"] = 0
+ 
+-        task_id = task["id"]
++        self._lifecycle[task_id] = "queued"
++        self._bump_revision(task_id)
++        self._tasks[task_id] = task
++
+         if queue not in self._queues:
+             self._queues[queue] = PriorityQueue()
+         self._queues[queue].push(task, priority)
+@@ -55,35 +88,98 @@ class TaskScheduler:
+         if "id" not in task:
+             task["id"] = str(uuid4())
+         task_id = task["id"]
+-        self._scheduled[task_id] = time.time() + delay
++        
++        if task_id in self._lifecycle:
++            self._check_lifecycle(task_id, ["queued", "failed"])
++            
++        self._lifecycle[task_id] = "scheduled"
++        self._bump_revision(task_id)
++        self._tasks[task_id] = task
++        
++        self._scheduled[task_id] = {"due_at": time.time() + delay, "queue": queue, "priority": priority}
+         return task_id
+ 
++    def reschedule(
++        self,
++        task_id: str,
++        delay: float,
++        queue: Optional[str] = None,
++        priority: Optional[int] = None,
++        expected_revision: Optional[int] = None,
++    ) -> bool:
++        if self._lifecycle.get(task_id) != "scheduled":
++            self._audit_records.append({"decision": "reject", "reason": "task_not_scheduled", "task_id": task_id})
++            return False
++
++        if expected_revision is not None and self._revisions.get(task_id, 0) != expected_revision:
++            self._audit_records.append({"decision": "reject", "reason": "stale_revision", "task_id": task_id})
++            return False
++
++        next_queue = queue or self._scheduled.get(task_id, {}).get("queue", "default")
++        next_priority = priority if priority is not None else self._scheduled.get(task_id, {}).get("priority", 0)
++
++        self._bump_revision(task_id)
++        self._scheduled[task_id] = {
++            "due_at": time.time() + delay,
++            "queue": next_queue,
++            "priority": next_priority
++        }
++        self._audit_records.append({"decision": "accept", "reason": "rescheduled", "task_id": task_id})
++        return True
++
+     async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+         now = time.time()
+-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
++        expired = [tid for tid, t in self._scheduled.items() if t["due_at"] <= now]
+         for tid in expired:
+-            task = self._scheduled.pop(tid)
+-            if task:
+-                self.enqueue(task, queue)
++            entry = self._scheduled.pop(tid)
++            task = self._tasks.get(tid)
++            if task and self._lifecycle.get(tid) == "scheduled":
++                self.enqueue(task, entry["queue"], priority=entry["priority"], revision=self._revisions.get(tid, 0))
+ 
+         if queue in self._queues and len(self._queues[queue]) > 0:
+             task = self._queues[queue].pop()
+             if task:
+-                self._in_flight[task["id"]] = task
++                task_id = task["id"]
++                self._check_lifecycle(task_id, ["queued"])
++                self._lifecycle[task_id] = "dispatched"
++                self._in_flight[task_id] = task
++                task["lifecycle"] = "in_flight"
++                self._bump_revision(task_id)
+                 return task
+         return None
+ 
+-    def complete(self, task_id: str) -> bool:
+-        return self._in_flight.pop(task_id, None) is not None
++    def complete(self, task_id: str, revision: int = -1) -> bool:
++        if revision != -1:
++            self._check_revision(task_id, revision)
++            
++        task = self._in_flight.pop(task_id, None)
++        if task:
++            self._check_lifecycle(task_id, ["dispatched"])
++            self._lifecycle[task_id] = "completed"
++            self._bump_revision(task_id)
++            return True
++        return False
+ 
+-    def fail(self, task_id: str, queue: str = "default") -> bool:
++    def fail(self, task_id: str, queue: str = "default", revision: int = -1) -> bool:
++        if revision != -1:
++            self._check_revision(task_id, revision)
++            
+         task = self._in_flight.pop(task_id, None)
+         if task:
++            self._check_lifecycle(task_id, ["dispatched"])
+             task["retries"] += 1
+             if task["retries"] < self._max_retries:
+-                self.enqueue(task, queue, priority=task.get("priority", 0))
++                self._lifecycle[task_id] = "failed"
++                self._bump_revision(task_id)
++                self.enqueue(task, queue, priority=task.get("priority", 0), revision=self._revisions.get(task_id, 0))
+                 return True
++            else:
++                self._lifecycle[task_id] = "failed"
++                self._bump_revision(task_id)
+         return False
++        
++    def audit_records(self) -> list:
++        return self._audit_records
+ 
+ # 2019-04-25T08:37:12 update
+ 
+diff --git a/tests/test_scheduler_reschedule.py b/tests/test_scheduler_reschedule.py
+new file mode 100644
+index 0000000..5665192
+--- /dev/null
++++ b/tests/test_scheduler_reschedule.py
+@@ -0,0 +1,74 @@
++import asyncio
++
++from src.orchestrator.scheduler import TaskScheduler
++
++class TestTaskSchedulerReschedule:
++
++    def setup_method(self):
++        self.scheduler = TaskScheduler()
++        
++    def test_due_scheduled_task_dequeues_with_original_id(self):
++        task_id = self.scheduler.schedule({"type": "delayed"}, delay=0)
++
++        task = asyncio.run(self.scheduler.dequeue())
++
++        assert task is not None
++        assert task["id"] == task_id
++        assert task["lifecycle"] == "in_flight"
++
++    def test_reschedule_in_flight_task_is_rejected_and_audited(self):
++        task_id = self.scheduler.schedule(
++            {
++                "type": "delayed",
++                "payload": {"secret": "private-runtime-data"},
++            },
++            delay=0,
++        )
++        task = asyncio.run(self.scheduler.dequeue())
++        assert task["id"] == task_id
++
++        assert self.scheduler.reschedule(task_id, delay=0) is False
++
++        assert task_id in self.scheduler._in_flight
++        audit_record = self.scheduler.audit_records()[-1]
++        assert audit_record["decision"] == "reject"
++        assert audit_record["task_id"] == task_id
++        assert audit_record["reason"] == "task_not_scheduled"
++        assert "private-runtime-data" not in repr(audit_record)
++
++    def test_reschedule_stale_revision_is_rejected(self):
++        task_id = self.scheduler.schedule(
++            {
++                "type": "delayed",
++                "payload": {"secret": "private-runtime-data"},
++            },
++            delay=30,
++        )
++        original_revision = self.scheduler._revisions[task_id]
++
++        assert self.scheduler.reschedule(
++            task_id,
++            delay=0,
++            expected_revision=original_revision - 1,
++        ) is False
++
++        audit_record = self.scheduler.audit_records()[-1]
++        assert audit_record["decision"] == "reject"
++        assert audit_record["reason"] == "stale_revision"
++        assert "private-runtime-data" not in repr(audit_record)
++
++    def test_reschedule_successful(self):
++        task_id = self.scheduler.schedule(
++            {
++                "type": "delayed",
++                "payload": {"secret": "private-runtime-data"},
++            },
++            delay=30,
++        )
++        original_revision = self.scheduler._revisions[task_id]
++
++        assert self.scheduler.reschedule(
++            task_id,
++            delay=0,
++            expected_revision=original_revision,
++        ) is True
+-- 
+2.47.3
+

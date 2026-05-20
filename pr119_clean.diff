@@ -1,0 +1,353 @@
+diff --git a/src/agent/registry.py b/src/agent/registry.py
+index fbedbe17..9caca9ec 100644
+--- a/src/agent/registry.py
++++ b/src/agent/registry.py
+@@ -1,10 +1,11 @@
+ """Agent Registry — Manages agent lifecycle and metadata."""
+ 
+-import json
++import hashlib
+ import time
+ import uuid
++from collections.abc import Iterable
+ from enum import Enum
+-from typing import Any, Dict, List, Optional
++from typing import Any, Dict, List, Optional, Set, Tuple
+ 
+ 
+ class AgentStatus(Enum):
+@@ -21,8 +22,19 @@ def __init__(self, storage_backend: str = "memory"):
+         self.storage_backend = storage_backend
+         self._agents: Dict[str, Dict[str, Any]] = {}
+         self._index: Dict[str, List[str]] = {}
+-
+-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
++        self._resolution_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
++        self._authorization_audit: List[Dict[str, Any]] = []
++
++    def register(
++        self,
++        name: str,
++        agent_type: str,
++        config: Optional[Dict] = None,
++    ) -> str:
++        config = config or {}
++        authorization_policy = self._normalize_authorization_policy(
++            config.get("authorization"),
++        )
+         agent_id = str(uuid.uuid4())
+         timestamp = time.time()
+         self._agents[agent_id] = {
+@@ -30,7 +42,9 @@ def register(self, name: str, agent_type: str, config: Optional[Dict] = None) ->
+             "name": name,
+             "type": agent_type,
+             "status": AgentStatus.PENDING.value,
+-            "config": config or {},
++            "config": config,
++            "authorization_policy": authorization_policy,
++            "authorization_revision": 1,
+             "created_at": timestamp,
+             "updated_at": timestamp,
+             "version": "1.0.0",
+@@ -45,7 +59,11 @@ def register(self, name: str, agent_type: str, config: Optional[Dict] = None) ->
+     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
+         return self._agents.get(agent_id)
+ 
+-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
++    def list(
++        self,
++        status: Optional[AgentStatus] = None,
++        group: Optional[str] = None,
++    ) -> List[Dict[str, Any]]:
+         agents = self._agents.values()
+         if status:
+             agents = [a for a in agents if a["status"] == status.value]
+@@ -73,6 +91,190 @@ def delete(self, agent_id: str) -> bool:
+     def count(self) -> int:
+         return len(self._agents)
+ 
++    def set_authorization_policy(
++        self,
++        agent_id: str,
++        policy: Dict[str, Iterable[str]],
++    ) -> bool:
++        agent = self._agents.get(agent_id)
++        if not agent:
++            return False
++        agent["authorization_policy"] = self._normalize_authorization_policy(
++            policy,
++        )
++        agent["authorization_revision"] += 1
++        agent["updated_at"] = time.time()
++        self._invalidate_authorization_cache(
++            agent_id,
++            agent["authorization_revision"],
++        )
++        return True
++
++    def resolve_authorized(
++        self,
++        agent_id: str,
++        principal_id: str,
++        permission: str,
++    ) -> Dict[str, Any]:
++        agent = self._agents.get(agent_id)
++        if not agent:
++            self._record_authorization_audit(
++                "authorization_resolution",
++                "deny",
++                "agent_not_found",
++                agent_id=agent_id,
++                principal_id=principal_id,
++                permission=permission,
++                authorization_revision=0,
++            )
++            raise PermissionError("Agent is not available")
++
++        revision = agent["authorization_revision"]
++        cache_key = (agent_id, principal_id, permission)
++        cached = self._resolution_cache.get(cache_key)
++        if cached and cached["authorization_revision"] != revision:
++            self._resolution_cache.pop(cache_key, None)
++            self._record_authorization_audit(
++                "authorization_cache_invalidated",
++                "defer",
++                "stale_authorization_revision",
++                agent_id=agent_id,
++                principal_id=principal_id,
++                permission=permission,
++                authorization_revision=revision,
++                invalidated_entries=1,
++            )
++            cached = None
++
++        if cached and self._has_permission(agent, principal_id, permission):
++            self._record_authorization_audit(
++                "authorization_resolution",
++                "allow",
++                "cache_hit",
++                agent_id=agent_id,
++                principal_id=principal_id,
++                permission=permission,
++                authorization_revision=revision,
++            )
++            return dict(agent)
++
++        if not self._has_permission(agent, principal_id, permission):
++            self._resolution_cache.pop(cache_key, None)
++            self._record_authorization_audit(
++                "authorization_resolution",
++                "deny",
++                "missing_permission",
++                agent_id=agent_id,
++                principal_id=principal_id,
++                permission=permission,
++                authorization_revision=revision,
++            )
++            raise PermissionError("Principal is not authorized")
++
++        self._resolution_cache[cache_key] = {
++            "agent_id": agent_id,
++            "authorization_revision": revision,
++        }
++        self._record_authorization_audit(
++            "authorization_resolution",
++            "allow",
++            "policy_match",
++            agent_id=agent_id,
++            principal_id=principal_id,
++            permission=permission,
++            authorization_revision=revision,
++        )
++        return dict(agent)
++
++    def authorization_audit(self) -> List[Dict[str, Any]]:
++        return [dict(record) for record in self._authorization_audit]
++
++    def _normalize_authorization_policy(
++        self,
++        policy: Optional[Dict[str, Iterable[str]]],
++    ) -> Dict[str, Set[str]]:
++        if policy is None:
++            return {}
++        if not isinstance(policy, dict):
++            raise ValueError("authorization policy must be a mapping")
++
++        normalized: Dict[str, Set[str]] = {}
++        for principal_id, permissions in policy.items():
++            if not isinstance(principal_id, str) or not principal_id:
++                raise ValueError("authorization principals must be named")
++            if isinstance(permissions, str) or not isinstance(
++                permissions,
++                Iterable,
++            ):
++                raise ValueError("authorization permissions must be a list")
++            normalized_permissions: Set[str] = set()
++            for permission in permissions:
++                if not isinstance(permission, str) or not permission:
++                    raise ValueError(
++                        "authorization permission entries must be named",
++                    )
++                normalized_permissions.add(permission)
++            normalized[principal_id] = normalized_permissions
++        return normalized
++
++    def _has_permission(
++        self,
++        agent: Dict[str, Any],
++        principal_id: str,
++        permission: str,
++    ) -> bool:
++        permissions = agent["authorization_policy"].get(principal_id, set())
++        return permission in permissions or "*" in permissions
++
++    def _invalidate_authorization_cache(
++        self,
++        agent_id: str,
++        authorization_revision: int,
++    ) -> None:
++        cache_keys = [
++            cache_key for cache_key in self._resolution_cache
++            if cache_key[0] == agent_id
++        ]
++        for cache_key in cache_keys:
++            self._resolution_cache.pop(cache_key, None)
++        self._record_authorization_audit(
++            "authorization_cache_invalidated",
++            "defer",
++            "permission_change",
++            agent_id=agent_id,
++            authorization_revision=authorization_revision,
++            invalidated_entries=len(cache_keys),
++        )
++
++    def _record_authorization_audit(
++        self,
++        event: str,
++        decision: str,
++        reason: str,
++        *,
++        agent_id: str,
++        authorization_revision: int,
++        principal_id: Optional[str] = None,
++        permission: Optional[str] = None,
++        invalidated_entries: Optional[int] = None,
++    ) -> None:
++        record: Dict[str, Any] = {
++            "event": event,
++            "decision": decision,
++            "reason": reason,
++            "agent_id": agent_id,
++            "authorization_revision": authorization_revision,
++        }
++        if principal_id is not None:
++            record["principal_hash"] = hashlib.sha256(
++                principal_id.encode("utf-8"),
++            ).hexdigest()[:12]
++        if permission is not None:
++            record["permission"] = permission
++        if invalidated_entries is not None:
++            record["invalidated_entries"] = invalidated_entries
++        self._authorization_audit.append(record)
++
+ # 2019-01-29T11:24:49 update
+ 
+ # 2019-04-09T13:38:38 update
+diff --git a/src/common/metrics.py b/src/common/metrics.py
+index 99d82f49..0c2ebf5f 100644
+--- a/src/common/metrics.py
++++ b/src/common/metrics.py
+@@ -32,19 +32,26 @@ def start_timer(self, metric: str) -> None:
+ 
+     def stop_timer(self, metric: str) -> float:
+         with self._lock:
+-            if metric in self._timers:
+-                duration = time.time() - self._timers.pop(metric)
+-                self.observe(metric, duration)
+-                return duration
+-        return 0.0
++            start = self._timers.pop(metric, None)
++        if start is None:
++            return 0.0
++        duration = time.time() - start
++        self.observe(metric, duration)
++        return duration
+ 
+     def snapshot(self) -> Dict:
+         with self._lock:
+             return {
+                 "counters": dict(self._counters),
+                 "gauges": dict(self._gauges),
+-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
+-                               for k, v in self._histograms.items()},
++                "histograms": {
++                    k: {
++                        "count": len(v),
++                        "sum": sum(v),
++                        "avg": sum(v) / len(v) if v else 0,
++                    }
++                    for k, v in self._histograms.items()
++                },
+             }
+ 
+ 
+diff --git a/tests/test_agent_registry.py b/tests/test_agent_registry.py
+index cc573745..da700b35 100644
+--- a/tests/test_agent_registry.py
++++ b/tests/test_agent_registry.py
+@@ -48,6 +48,55 @@ def test_delete_agent(self):
+     def test_delete_nonexistent_agent(self):
+         assert not self.registry.delete("nonexistent-id")
+ 
++    def test_cached_resolution_rechecks_policy_after_permission_change(self):
++        agent_id = self.registry.register(
++            "test-agent",
++            "worker.processor",
++            config={
++                "authorization": {"alice": ["tasks:route"]},
++                "private_token": "should-not-leak",
++            },
++        )
++
++        resolved = self.registry.resolve_authorized(
++            agent_id,
++            principal_id="alice",
++            permission="tasks:route",
++        )
++        assert resolved["id"] == agent_id
++
++        self.registry.update_status(agent_id, AgentStatus.RUNNING)
++        assert self.registry.set_authorization_policy(agent_id, {"alice": []})
++
++        with pytest.raises(PermissionError):
++            self.registry.resolve_authorized(
++                agent_id,
++                principal_id="alice",
++                permission="tasks:route",
++            )
++
++        agent = self.registry.get(agent_id)
++        assert agent["status"] == AgentStatus.RUNNING.value
++
++        audit = self.registry.authorization_audit()
++        assert any(
++            record["event"] == "authorization_cache_invalidated"
++            for record in audit
++        )
++        assert audit[-1]["event"] == "authorization_resolution"
++        assert audit[-1]["decision"] == "deny"
++        assert audit[-1]["reason"] == "missing_permission"
++        assert "alice" not in repr(audit)
++        assert "should-not-leak" not in repr(audit)
++
++    def test_register_rejects_invalid_authorization_policy(self):
++        with pytest.raises(ValueError):
++            self.registry.register(
++                "test-agent",
++                "worker.processor",
++                config={"authorization": {"alice": "tasks:route"}},
++            )
++
+ # 2019-01-23T10:28:57 update
+ 
+ # 2019-01-28T18:15:57 update

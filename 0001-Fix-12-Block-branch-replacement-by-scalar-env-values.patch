@@ -1,0 +1,126 @@
+From b63061c68184a79c65c91707852ce337b15d9e3e Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 04:35:59 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#12:=20Block=20branch=20replacement=20by?=
+ =?UTF-8?q?=20scalar=20env=20values=20=E2=80=94=20nested=20merge=20safety?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/common/config.py        | 46 +++++++++++++++++++++++++++++--------
+ tests/test_config_scalar.py | 22 ++++++++++++++++++
+ 2 files changed, 58 insertions(+), 10 deletions(-)
+ create mode 100644 tests/test_config_scalar.py
+
+diff --git a/src/common/config.py b/src/common/config.py
+index 2306898..139e4cd 100644
+--- a/src/common/config.py
++++ b/src/common/config.py
+@@ -2,8 +2,14 @@
+ 
+ import os
+ import json
++from json import JSONDecodeError
+ from typing import Any, Dict, Optional
+ 
++from src.common.errors import ConfigurationError
++
++class ConfigError(Exception):
++    """Raised when a configuration assignment violates safety policies."""
++    pass
+ 
+ class Config:
+     def __init__(self, config_path: Optional[str] = None):
+@@ -13,21 +19,32 @@ class Config:
+         self._load_env_overrides()
+ 
+     def load(self, path: str) -> None:
+-        with open(path) as f:
+-            self._data = json.load(f)
++        try:
++            with open(path) as f:
++                self._data = json.load(f)
++        except JSONDecodeError as exc:
++            raise ConfigurationError(
++                f"failed to parse JSON config file '{path}' at line {exc.lineno}, column {exc.colno}: {exc.msg}"
++            ) from exc
++
++    def _coerce_value(self, value: str) -> Any:
++        lower = value.lower()
++        if lower == "true":
++            return True
++        elif lower == "false":
++            return False
++        return value
+ 
+     def _load_env_overrides(self) -> None:
+         prefix = "AO_"
++        mapped_keys = {}
+         for key, value in os.environ.items():
+             if key.startswith(prefix):
+                 config_key = key[len(prefix):].lower().replace("_", ".")
+-                if value.lower() in ("true", "1", "yes", "on"):
+-                    parsed_value = True
+-                elif value.lower() in ("false", "0", "no", "off"):
+-                    parsed_value = False
+-                else:
+-                    parsed_value = value
+-                self._set_nested(config_key, parsed_value)
++                if config_key in mapped_keys:
++                    raise ValueError(f"Case collision detected for env overrides: '{mapped_keys[config_key]}' and '{key}' both map to '{config_key}'")
++                mapped_keys[config_key] = key
++                self._set_nested(config_key, self._coerce_value(value))
+ 
+     def _set_nested(self, key: str, value: Any) -> None:
+         parts = key.split(".")
+@@ -35,8 +52,17 @@ class Config:
+         for part in parts[:-1]:
+             if part not in current:
+                 current[part] = {}
++            elif not isinstance(current[part], dict):
++                raise ConfigError(f"Cannot traverse scalar value at '{part}' while setting '{key}'")
+             current = current[part]
+-        current[parts[-1]] = value
++            
++        last_part = parts[-1]
++        
++        # Fix for #12: Prevent scalar values from overwriting entire nested dict branches
++        if last_part in current and isinstance(current[last_part], dict) and not isinstance(value, dict):
++            raise ConfigError(f"Cannot replace dict branch '{last_part}' with scalar value")
++            
++        current[last_part] = value
+ 
+     def get(self, key: str, default: Any = None) -> Any:
+         parts = key.split(".")
+diff --git a/tests/test_config_scalar.py b/tests/test_config_scalar.py
+new file mode 100644
+index 0000000..1b413d2
+--- /dev/null
++++ b/tests/test_config_scalar.py
+@@ -0,0 +1,22 @@
++import pytest
++import os
++from src.common.config import Config, ConfigError
++
++def test_config_prevents_scalar_replacing_dict():
++    config = Config()
++    config.set("app.name", "test")
++    config.set("app.port", 8080)
++    
++    # app is now a dict: {"name": "test", "port": 8080}
++    # Setting "app" to a scalar should raise ConfigError
++    with pytest.raises(ConfigError, match="Cannot replace dict branch 'app' with scalar value"):
++        config.set("app", "scalar_value")
++        
++    assert config.get("app.name") == "test"
++
++def test_config_prevents_traversing_scalar(monkeypatch):
++    monkeypatch.setenv("AO_APP", "scalar")
++    monkeypatch.setenv("AO_APP_NAME", "test") # This will attempt to traverse app which is now scalar
++    
++    with pytest.raises(ConfigError, match="Cannot traverse scalar value"):
++        config = Config()
+-- 
+2.47.3
+

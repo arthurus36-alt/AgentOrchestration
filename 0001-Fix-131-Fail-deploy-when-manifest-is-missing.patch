@@ -1,0 +1,69 @@
+From 32263291cef7528bf2b7972b80922cb42295b128 Mon Sep 17 00:00:00 2001
+From: Bot <bot@example.com>
+Date: Wed, 20 May 2026 00:33:23 +0000
+Subject: [PATCH] Fix #131: Fail deploy when manifest is missing
+
+---
+ src/cli/main.py   |  4 ++++
+ tests/test_cli.py | 27 +++++++++++++++++++++++++++
+ 2 files changed, 31 insertions(+)
+ create mode 100644 tests/test_cli.py
+
+diff --git a/src/cli/main.py b/src/cli/main.py
+index 2458cb9..fe2ba92 100644
+--- a/src/cli/main.py
++++ b/src/cli/main.py
+@@ -2,6 +2,7 @@
+ 
+ import argparse
+ import sys
++import os
+ 
+ from src.common.config import Config
+ from src.common.logging import configure_logging
+@@ -37,6 +38,9 @@ def cli():
+     if args.command == "init":
+         print(f"Initializing project: {args.name}")
+     elif args.command == "deploy":
++        if not os.path.exists(args.manifest):
++            print(f"Error: Manifest file '{args.manifest}' does not exist.", file=sys.stderr)
++            sys.exit(1)
+         print(f"Deploying agent from manifest: {args.manifest}")
+     elif args.command == "status":
+         print("Checking agent status...")
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+new file mode 100644
+index 0000000..b796391
+--- /dev/null
++++ b/tests/test_cli.py
+@@ -0,0 +1,27 @@
++import sys
++import pytest
++from src.cli.main import cli
++
++def test_deploy_missing_manifest(capsys, monkeypatch):
++    monkeypatch.setattr(sys, "argv", ["orchestrator-cli", "deploy", "nonexistent.yaml"])
++    
++    with pytest.raises(SystemExit) as exc_info:
++        cli()
++        
++    assert exc_info.value.code == 1
++    captured = capsys.readouterr()
++    assert "does not exist" in captured.err
++
++def test_deploy_existing_manifest(capsys, monkeypatch, tmp_path):
++    manifest_file = tmp_path / "agent.yaml"
++    manifest_file.touch()
++    
++    monkeypatch.setattr(sys, "argv", ["orchestrator-cli", "deploy", str(manifest_file)])
++    
++    try:
++        cli()
++    except SystemExit:
++        pytest.fail("cli() exited unexpectedly")
++        
++    captured = capsys.readouterr()
++    assert "Deploying agent from manifest:" in captured.out
+-- 
+2.47.3
+

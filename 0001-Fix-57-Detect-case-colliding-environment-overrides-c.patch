@@ -1,0 +1,48 @@
+From 87f3dd4f1b5fb2c534d6f64095cb433e73f8a4dc Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 04:45:58 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#57:=20Detect=20case-colliding=20environm?=
+ =?UTF-8?q?ent=20overrides=20=E2=80=94=20case=20handling?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/common/config.py           |  1 -
+ tests/test_config_collision.py | 12 ++++++++++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+ create mode 100644 tests/test_config_collision.py
+
+diff --git a/src/common/config.py b/src/common/config.py
+index 139e4cd..c72fc1d 100644
+--- a/src/common/config.py
++++ b/src/common/config.py
+@@ -58,7 +58,6 @@ class Config:
+             
+         last_part = parts[-1]
+         
+-        # Fix for #12: Prevent scalar values from overwriting entire nested dict branches
+         if last_part in current and isinstance(current[last_part], dict) and not isinstance(value, dict):
+             raise ConfigError(f"Cannot replace dict branch '{last_part}' with scalar value")
+             
+diff --git a/tests/test_config_collision.py b/tests/test_config_collision.py
+new file mode 100644
+index 0000000..d2fd775
+--- /dev/null
++++ b/tests/test_config_collision.py
+@@ -0,0 +1,12 @@
++import pytest
++from src.common.config import Config
++
++class TestConfigCollision:
++    def test_env_collision(self, monkeypatch):
++        monkeypatch.setenv("AO_APP_PORT", "8081")
++        monkeypatch.setenv("AO_app_port", "8082")
++        with pytest.raises(ValueError) as exc:
++            Config()
++        assert "Case collision detected" in str(exc.value)
++        assert "AO_APP_PORT" in str(exc.value)
++        assert "AO_app_port" in str(exc.value)
+-- 
+2.47.3
+

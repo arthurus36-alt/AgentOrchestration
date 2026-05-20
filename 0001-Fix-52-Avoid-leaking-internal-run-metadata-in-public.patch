@@ -1,0 +1,390 @@
+From f86ff5a7c728140a2032b9e29234348923a0053b Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 03:36:54 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#52:=20Avoid=20leaking=20internal=20run?=
+ =?UTF-8?q?=20metadata=20in=20public=20events=20=E2=80=94=20payload=20shap?=
+ =?UTF-8?q?ing?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/orchestrator/__init__.py   |   3 +-
+ src/orchestrator/webhooks.py   | 253 +++++++++++++++++++++++++++++++++
+ tests/test_webhook_delivery.py |  89 ++++++++++++
+ 3 files changed, 344 insertions(+), 1 deletion(-)
+ create mode 100644 src/orchestrator/webhooks.py
+ create mode 100644 tests/test_webhook_delivery.py
+
+diff --git a/src/orchestrator/__init__.py b/src/orchestrator/__init__.py
+index 5d925b2..6b4b10c 100644
+--- a/src/orchestrator/__init__.py
++++ b/src/orchestrator/__init__.py
+@@ -3,8 +3,9 @@
+ from .engine import OrchestrationEngine
+ from .scheduler import TaskScheduler
+ from .workflow import WorkflowManager
++from .webhooks import WebhookDeliveryService, WebhookEndpoint, WebhookDeliveryRecord
+ 
+-__all__ = ["OrchestrationEngine", "TaskScheduler", "WorkflowManager"]
++__all__ = ["OrchestrationEngine", "TaskScheduler", "WorkflowManager", "WebhookDeliveryService", "WebhookEndpoint", "WebhookDeliveryRecord"]
+ 
+ # 2019-07-01T16:04:27 update
+ 
+diff --git a/src/orchestrator/webhooks.py b/src/orchestrator/webhooks.py
+new file mode 100644
+index 0000000..9c52e4f
+--- /dev/null
++++ b/src/orchestrator/webhooks.py
+@@ -0,0 +1,253 @@
++"""Webhook endpoint registration and public payload shaping."""
++
++import time
++from dataclasses import dataclass, field
++from typing import Any, Callable, Dict, List, Optional, Tuple
++from urllib.parse import urlparse
++from uuid import uuid4
++
++
++INTERNAL_FIELD_PREFIXES = ("_", "internal_")
++INTERNAL_FIELD_NAMES = {
++    "api_key",
++    "authorization",
++    "headers",
++    "password",
++    "private_key",
++    "secret",
++    "token",
++}
++
++
++@dataclass
++class WebhookEndpoint:
++    id: str
++    workspace_id: str
++    url: str
++    secret: str = field(repr=False)
++    enabled: bool = True
++    version: int = 1
++    created_at: float = field(default_factory=time.time)
++    updated_at: float = field(default_factory=time.time)
++
++
++@dataclass
++class WebhookDeliveryRecord:
++    id: str
++    endpoint_id: str
++    workspace_id: str
++    event: str
++    payload: Dict[str, Any]
++    status: str
++    attempts: int = 1
++    reason: Optional[str] = None
++    created_at: float = field(default_factory=time.time)
++
++
++class WebhookDeliveryService:
++    def __init__(self):
++        self._endpoints: Dict[str, WebhookEndpoint] = {}
++        self._deliveries: Dict[Tuple[str, str, str], WebhookDeliveryRecord] = {}
++        self._callbacks: Dict[str, List[Callable[[WebhookDeliveryRecord], None]]] = {}
++
++    def _validate_workspace(self, workspace_id: str) -> None:
++        if not workspace_id:
++            raise ValueError("workspace_id cannot be empty")
++
++    def _validate_url(self, url: str) -> None:
++        if not url:
++            raise ValueError("url cannot be empty")
++        parsed = urlparse(url)
++        if parsed.scheme not in {"http", "https"}:
++            raise ValueError("invalid url scheme")
++
++    def _require_endpoint(self, endpoint_id: str) -> WebhookEndpoint:
++        endpoint = self._endpoints.get(endpoint_id)
++        if not endpoint:
++            raise ValueError("endpoint not found")
++        return endpoint
++
++    def register_endpoint(self, workspace_id: str, url: str, secret: str) -> WebhookEndpoint:
++        self._validate_workspace(workspace_id)
++        self._validate_url(url)
++        endpoint = WebhookEndpoint(
++            id=str(uuid4()),
++            workspace_id=workspace_id,
++            url=url,
++            secret=secret,
++        )
++        self._endpoints[endpoint.id] = endpoint
++        return endpoint
++
++    def endpoints(self, workspace_id: str) -> List[WebhookEndpoint]:
++        return [
++            endpoint
++            for endpoint in self._endpoints.values()
++            if endpoint.workspace_id == workspace_id
++        ]
++
++    def disable_endpoint(self, endpoint_id: str) -> bool:
++        endpoint = self._endpoints.get(endpoint_id)
++        if not endpoint:
++            return False
++        endpoint.enabled = False
++        endpoint.updated_at = time.time()
++        return True
++
++    def rotate_endpoint(
++        self,
++        endpoint_id: str,
++        *,
++        url: Optional[str] = None,
++        secret: Optional[str] = None,
++    ) -> WebhookEndpoint:
++        endpoint = self._require_endpoint(endpoint_id)
++        if url is not None:
++            self._validate_url(url)
++            endpoint.url = url
++        if secret is not None:
++            endpoint.secret = secret
++        endpoint.version += 1
++        endpoint.enabled = True
++        endpoint.updated_at = time.time()
++        return endpoint
++
++    def register_callback(
++        self,
++        event: str,
++        callback: Callable[[WebhookDeliveryRecord], None],
++    ) -> None:
++        self._callbacks.setdefault(event, []).append(callback)
++
++    def deliver(
++        self,
++        endpoint_id: str,
++        workspace_id: str,
++        event: str,
++        data: Dict[str, Any],
++        idempotency_key: str,
++        *,
++        endpoint_version: Optional[int] = None,
++        sender: Optional[Callable[[WebhookEndpoint, Dict[str, Any]], Any]] = None,
++    ) -> WebhookDeliveryRecord:
++        if not idempotency_key:
++            raise ValueError("idempotency_key is required")
++
++        delivery_key = (endpoint_id, workspace_id, idempotency_key)
++        existing = self._deliveries.get(delivery_key)
++        if existing and existing.status in {"delivered", "rejected"}:
++            return existing
++
++        endpoint = self._endpoints.get(endpoint_id)
++        reason = self._rejection_reason(endpoint, workspace_id, endpoint_version)
++        if reason:
++            return self._store_delivery(
++                delivery_key,
++                endpoint_id,
++                workspace_id,
++                event,
++                {},
++                "rejected",
++                reason,
++            )
++
++        payload = existing.payload if existing else {
++            "event": event,
++            "workspace_id": workspace_id,
++            "data": self._shape_public_payload(data),
++        }
++        attempts = existing.attempts + 1 if existing else 1
++
++        if sender and endpoint:
++            try:
++                response = sender(endpoint, payload)
++                status_code = int(response or 200)
++            except Exception as exc:
++                return self._store_delivery(
++                    delivery_key,
++                    endpoint_id,
++                    workspace_id,
++                    event,
++                    payload,
++                    "failed",
++                    exc.__class__.__name__,
++                    attempts,
++                )
++            if not 200 <= status_code < 300:
++                return self._store_delivery(
++                    delivery_key,
++                    endpoint_id,
++                    workspace_id,
++                    event,
++                    payload,
++                    "failed",
++                    f"http_status_{status_code}",
++                    attempts,
++                )
++
++        record = self._store_delivery(
++            delivery_key,
++            endpoint_id,
++            workspace_id,
++            event,
++            payload,
++            "delivered",
++            attempts=attempts,
++        )
++        for callback in self._callbacks.get(event, []):
++            callback(record)
++        return record
++
++    def _store_delivery(
++        self,
++        delivery_key: Tuple[str, str, str],
++        endpoint_id: str,
++        workspace_id: str,
++        event: str,
++        payload: Dict[str, Any],
++        status: str,
++        reason: Optional[str] = None,
++        attempts: int = 1,
++    ) -> WebhookDeliveryRecord:
++        record = WebhookDeliveryRecord(
++            id=str(uuid4()),
++            endpoint_id=endpoint_id,
++            workspace_id=workspace_id,
++            event=event,
++            payload=payload,
++            status=status,
++            attempts=attempts,
++            reason=reason,
++        )
++        self._deliveries[delivery_key] = record
++        return record
++
++    def _rejection_reason(
++        self,
++        endpoint: Optional[WebhookEndpoint],
++        workspace_id: str,
++        endpoint_version: Optional[int],
++    ) -> Optional[str]:
++        if endpoint is None:
++            return "endpoint_not_found"
++        if endpoint.workspace_id != workspace_id:
++            return "workspace_mismatch"
++        if not endpoint.enabled:
++            return "endpoint_disabled"
++        if endpoint_version is not None and endpoint.version != endpoint_version:
++            return "endpoint_rotated"
++        return None
++
++    def _shape_public_payload(self, value: Any) -> Any:
++        if isinstance(value, dict):
++            shaped = {}
++            for k, v in value.items():
++                if any(k.startswith(prefix) for prefix in INTERNAL_FIELD_PREFIXES):
++                    continue
++                if k in INTERNAL_FIELD_NAMES:
++                    continue
++                shaped[k] = self._shape_public_payload(v)
++            return shaped
++        if isinstance(value, list):
++            return [self._shape_public_payload(i) for i in value]
++        return value
+diff --git a/tests/test_webhook_delivery.py b/tests/test_webhook_delivery.py
+new file mode 100644
+index 0000000..ba0492e
+--- /dev/null
++++ b/tests/test_webhook_delivery.py
+@@ -0,0 +1,89 @@
++import pytest
++from src.orchestrator.webhooks import WebhookDeliveryService
++
++class TestWebhookDelivery:
++    def test_valid_delivery_filters_internal_run_metadata(self):
++        svc = WebhookDeliveryService()
++        ep = svc.register_endpoint("ws1", "http://example.com", "secret")
++        
++        data = {
++            "public_id": "abc",
++            "_internal_trace": "hidden",
++            "internal_worker": "hidden",
++            "api_key": "hidden",
++            "nested": {
++                "safe": "visible",
++                "secret": "hidden"
++            }
++        }
++        
++        rec = svc.deliver(ep.id, "ws1", "run.completed", data, "idemp1")
++        assert rec.status == "delivered"
++        payload_data = rec.payload["data"]
++        
++        assert "public_id" in payload_data
++        assert "_internal_trace" not in payload_data
++        assert "internal_worker" not in payload_data
++        assert "api_key" not in payload_data
++        assert payload_data["nested"] == {"safe": "visible"}
++        assert "secret" not in payload_data["nested"]
++
++    def test_endpoint_url_is_validated_before_persistence(self):
++        svc = WebhookDeliveryService()
++        with pytest.raises(ValueError):
++            svc.register_endpoint("ws1", "ftp://example.com", "secret")
++
++    def test_rejects_disabled_and_cross_workspace_delivery(self):
++        svc = WebhookDeliveryService()
++        ep = svc.register_endpoint("ws1", "http://example.com", "secret")
++        
++        rec1 = svc.deliver(ep.id, "ws2", "run.completed", {}, "idemp1")
++        assert rec1.status == "rejected"
++        assert rec1.reason == "workspace_mismatch"
++        
++        svc.disable_endpoint(ep.id)
++        rec2 = svc.deliver(ep.id, "ws1", "run.completed", {}, "idemp2")
++        assert rec2.status == "rejected"
++        assert rec2.reason == "endpoint_disabled"
++
++    def test_delivery_records_and_callbacks_are_idempotent_for_retries(self):
++        svc = WebhookDeliveryService()
++        ep = svc.register_endpoint("ws1", "http://example.com", "secret")
++        
++        rec1 = svc.deliver(ep.id, "ws1", "run.completed", {"id": "1"}, "idemp1")
++        assert rec1.status == "delivered"
++        
++        rec2 = svc.deliver(ep.id, "ws1", "run.completed", {"id": "1"}, "idemp1")
++        assert rec2.status == "delivered"
++        assert rec1.id == rec2.id
++        assert rec1.attempts == rec2.attempts
++
++    def test_failed_delivery_retries_with_same_public_payload(self):
++        svc = WebhookDeliveryService()
++        ep = svc.register_endpoint("ws1", "http://example.com", "secret")
++        
++        def fail_sender(ep, payload):
++            raise RuntimeError("network error")
++            
++        def ok_sender(ep, payload):
++            return 200
++            
++        rec1 = svc.deliver(ep.id, "ws1", "run.completed", {"safe": "yes", "_hidden": "no"}, "idemp1", sender=fail_sender)
++        assert rec1.status == "failed"
++        assert rec1.attempts == 1
++        
++        rec2 = svc.deliver(ep.id, "ws1", "run.completed", {"safe": "yes", "_hidden": "no"}, "idemp1", sender=ok_sender)
++        assert rec2.status == "delivered"
++        assert rec2.attempts == 2
++        assert "_hidden" not in rec2.payload["data"]
++
++    def test_rotated_endpoint_rejects_stale_delivery_version(self):
++        svc = WebhookDeliveryService()
++        ep = svc.register_endpoint("ws1", "http://example.com", "secret")
++        
++        ep = svc.rotate_endpoint(ep.id, secret="new_secret")
++        assert ep.version == 2
++        
++        rec = svc.deliver(ep.id, "ws1", "run.completed", {}, "idemp1", endpoint_version=1)
++        assert rec.status == "rejected"
++        assert rec.reason == "endpoint_rotated"
+-- 
+2.47.3
+

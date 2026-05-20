@@ -1,0 +1,243 @@
+From ff84314c8349b278c0a78784a110cc0e3ff732e2 Mon Sep 17 00:00:00 2001
+From: Bot <bot@example.com>
+Date: Tue, 19 May 2026 23:46:15 +0000
+Subject: [PATCH] Fix #112: Enforce least-privilege scopes on run cancellation
+
+---
+ src/agent/executor.py              | 34 ++++++++++-
+ src/common/auth.py                 | 52 +++++++++++++++++
+ tests/test_operator_cancel_auth.py | 90 ++++++++++++++++++++++++++++++
+ 3 files changed, 174 insertions(+), 2 deletions(-)
+ create mode 100644 src/common/auth.py
+ create mode 100644 tests/test_operator_cancel_auth.py
+
+diff --git a/src/agent/executor.py b/src/agent/executor.py
+index fedfe27..aa662b0 100644
+--- a/src/agent/executor.py
++++ b/src/agent/executor.py
+@@ -5,21 +5,32 @@ import time
+ from typing import Any, Callable, Dict, Optional
+ from uuid import uuid4
+ 
++from src.common.auth import AuthorizationService, OperatorPrincipal
++
+ 
+ class AgentExecutor:
+     def __init__(self, max_concurrent: int = 5):
+         self.max_concurrent = max_concurrent
+         self._semaphore = asyncio.Semaphore(max_concurrent)
+         self._active_tasks: Dict[str, asyncio.Task] = {}
++        self._execution_workspaces: Dict[str, str] = {}
+         self._results: Dict[str, Any] = {}
+ 
+-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
++    async def execute(
++        self,
++        agent_id: str,
++        task: Dict[str, Any],
++        handler: Callable,
++        *,
++        workspace_id: Optional[str] = None,
++    ) -> str:
+         execution_id = str(uuid4())
+         async with self._semaphore:
+             task_obj = asyncio.create_task(
+                 self._run_execution(execution_id, agent_id, task, handler)
+             )
+             self._active_tasks[execution_id] = task_obj
++            self._execution_workspaces[execution_id] = workspace_id or task.get("workspace_id") or agent_id
+             try:
+                 result = await task_obj
+                 self._results[execution_id] = result
+@@ -27,6 +38,7 @@ class AgentExecutor:
+                 self._results[execution_id] = {"error": str(e)}
+             finally:
+                 self._active_tasks.pop(execution_id, None)
++                self._execution_workspaces.pop(execution_id, None)
+         return execution_id
+ 
+     async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+@@ -45,7 +57,25 @@ class AgentExecutor:
+     def get_result(self, execution_id: str) -> Optional[Any]:
+         return self._results.get(execution_id)
+ 
+-    def cancel(self, execution_id: str) -> bool:
++    def active_execution_ids(self) -> tuple[str, ...]:
++        return tuple(self._active_tasks.keys())
++
++    def cancel(
++        self,
++        execution_id: str,
++        *,
++        principal: Optional[OperatorPrincipal] = None,
++        authorizer: Optional[AuthorizationService] = None,
++    ) -> bool:
++        workspace_id = self._execution_workspaces.get(execution_id)
++        if workspace_id is None:
++            return False
++
++        (authorizer or AuthorizationService()).require_run_cancellation(
++            principal,
++            workspace_id=workspace_id,
++        )
++
+         task = self._active_tasks.get(execution_id)
+         if task and not task.done():
+             task.cancel()
+diff --git a/src/common/auth.py b/src/common/auth.py
+new file mode 100644
+index 0000000..58e3a49
+--- /dev/null
++++ b/src/common/auth.py
+@@ -0,0 +1,52 @@
++"""Authorization helpers for operator-scoped actions."""
++
++from dataclasses import dataclass, field
++import time
++from typing import Optional, Set
++
++
++RUN_CANCEL_SCOPE = "runs:cancel"
++ADMIN_ROLE = "admin"
++OPERATOR_ROLE = "operator"
++
++
++class PermissionDenied(Exception):
++    """Raised when an authenticated principal cannot perform an action."""
++
++
++@dataclass(frozen=True)
++class OperatorPrincipal:
++    subject: str
++    workspace_id: str
++    role: str
++    scopes: Set[str] = field(default_factory=set)
++    expires_at: Optional[float] = None
++    revoked: bool = False
++
++
++class AuthorizationService:
++    def require_run_cancellation(
++        self,
++        principal: Optional[OperatorPrincipal],
++        *,
++        workspace_id: str,
++        now: Optional[float] = None,
++    ) -> None:
++        if principal is None:
++            raise PermissionDenied("anonymous principals cannot cancel runs")
++
++        if principal.revoked:
++            raise PermissionDenied("revoked operator token")
++
++        current_time = time.time() if now is None else now
++        if principal.expires_at is not None and principal.expires_at <= current_time:
++            raise PermissionDenied("stale operator token")
++
++        if principal.workspace_id != workspace_id:
++            raise PermissionDenied("operator token is scoped to a different workspace")
++
++        if principal.role not in {OPERATOR_ROLE, ADMIN_ROLE}:
++            raise PermissionDenied("operator role required to cancel runs")
++
++        if "*" not in principal.scopes and RUN_CANCEL_SCOPE not in principal.scopes:
++            raise PermissionDenied("runs:cancel scope required")
+diff --git a/tests/test_operator_cancel_auth.py b/tests/test_operator_cancel_auth.py
+new file mode 100644
+index 0000000..1271cb3
+--- /dev/null
++++ b/tests/test_operator_cancel_auth.py
+@@ -0,0 +1,90 @@
++import asyncio
++import time
++
++import pytest
++
++from src.agent.executor import AgentExecutor
++from src.common.auth import (
++    AuthorizationService,
++    OperatorPrincipal,
++    PermissionDenied,
++    RUN_CANCEL_SCOPE,
++)
++
++
++def operator_principal(**overrides):
++    data = {
++        "subject": "user-1",
++        "workspace_id": "workspace-a",
++        "role": "operator",
++        "scopes": {RUN_CANCEL_SCOPE},
++        "expires_at": time.time() + 60,
++        "revoked": False,
++    }
++    data.update(overrides)
++    return OperatorPrincipal(**data)
++
++
++class TestRunCancellationAuthorization:
++    def test_denies_anonymous_principal(self):
++        service = AuthorizationService()
++
++        with pytest.raises(PermissionDenied, match="anonymous"):
++            service.require_run_cancellation(None, workspace_id="workspace-a")
++
++    def test_denies_stale_operator_token(self):
++        service = AuthorizationService()
++        principal = operator_principal(expires_at=time.time() - 1)
++
++        with pytest.raises(PermissionDenied, match="stale"):
++            service.require_run_cancellation(principal, workspace_id="workspace-a")
++
++    def test_denies_revoked_operator_token(self):
++        service = AuthorizationService()
++        principal = operator_principal(revoked=True)
++
++        with pytest.raises(PermissionDenied, match="revoked"):
++            service.require_run_cancellation(principal, workspace_id="workspace-a")
++
++    def test_denies_insufficient_scope(self):
++        service = AuthorizationService()
++        principal = operator_principal(scopes={"runs:read"})
++
++        with pytest.raises(PermissionDenied, match=RUN_CANCEL_SCOPE):
++            service.require_run_cancellation(principal, workspace_id="workspace-a")
++
++    def test_denies_wrong_workspace_role(self):
++        service = AuthorizationService()
++        principal = operator_principal(workspace_id="workspace-b")
++
++        with pytest.raises(PermissionDenied, match="workspace"):
++            service.require_run_cancellation(principal, workspace_id="workspace-a")
++
++    def test_authorized_operator_can_cancel_active_execution(self):
++        async def run_case():
++            executor = AgentExecutor()
++            task = asyncio.create_task(asyncio.sleep(60))
++            executor._active_tasks["exec-1"] = task
++            executor._execution_workspaces["exec-1"] = "workspace-a"
++
++            assert executor.cancel("exec-1", principal=operator_principal())
++            await asyncio.sleep(0)
++            assert task.cancelled()
++
++        asyncio.run(run_case())
++
++    def test_cancel_rejects_insufficient_principal_before_touching_task(self):
++        async def run_case():
++            executor = AgentExecutor()
++            task = asyncio.create_task(asyncio.sleep(60))
++            executor._active_tasks["exec-1"] = task
++            executor._execution_workspaces["exec-1"] = "workspace-a"
++
++            with pytest.raises(PermissionDenied):
++                executor.cancel("exec-1", principal=operator_principal(scopes=set()))
++
++            assert not task.cancelled()
++            task.cancel()
++            await asyncio.sleep(0)
++
++        asyncio.run(run_case())
+-- 
+2.47.3
+

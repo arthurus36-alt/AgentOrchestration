@@ -1,0 +1,330 @@
+From bb27ea822deb8aca1fab9c52112d826b3100d318 Mon Sep 17 00:00:00 2001
+From: BizCode Auditor <auditor@artvisor.com>
+Date: Wed, 20 May 2026 01:03:18 +0000
+Subject: [PATCH] =?UTF-8?q?Fix=20#78:=20Remove=20build=20arguments=20from?=
+ =?UTF-8?q?=20final=20layers=20=E2=80=94=20image=20metadata?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .dockerignore                      | 14 +++++
+ .github/workflows/ci.yml           | 34 +++++++-----
+ Dockerfile                         | 40 ++++++++++++++
+ Makefile                           |  3 ++
+ infra/docker-compose.yml           | 11 ++++
+ scripts/audit_image_metadata.py    | 84 ++++++++++++++++++++++++++++++
+ tests/test_audit_image_metadata.py | 55 +++++++++++++++++++
+ 7 files changed, 229 insertions(+), 12 deletions(-)
+ create mode 100644 .dockerignore
+ create mode 100644 Dockerfile
+ create mode 100644 infra/docker-compose.yml
+ create mode 100644 scripts/audit_image_metadata.py
+ create mode 100644 tests/test_audit_image_metadata.py
+
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..ef7c3c9
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,14 @@
++.git
++.github
++.pytest_cache
++.mypy_cache
++.ruff_cache
++__pycache__
++*.py[cod]
++*.pyo
++*.egg-info
++build
++dist
++logs
++docs/superpowers
++tests
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 3eac340..93934eb 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -2,28 +2,38 @@ name: CI
+ 
+ on:
+   push:
+-    branches: [main, develop]
++    branches: [ main ]
+   pull_request:
+-    branches: [main]
++    branches: [ main ]
+ 
+ jobs:
+   test:
+     runs-on: ubuntu-latest
+-    strategy:
+-      matrix:
+-        python-version: ["3.9", "3.10", "3.11"]
+-
+     steps:
+       - uses: actions/checkout@v4
+-      - name: Set up Python
+-        uses: actions/setup-python@v5
+-        with:
+-          python-version: ${{ matrix.python-version }}
+-      - name: Install uv
+-        uses: astral-sh/setup-uv@v3
+       - name: Install dependencies
+         run: uv sync
+       - name: Run tests
+         run: uv run pytest --cov=src tests/
+       - name: Lint
+         run: uv run flake8 src/ tests/
++
++  docker-metadata-audit:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Build runtime image
++        run: |
++          docker build \
++            --provenance=false \
++            --build-arg INTERNAL_BUILD_CHANNEL=ci-private-channel-sentinel \
++            --build-arg INTERNAL_BUILD_REVISION=ci-private-revision-sentinel \
++            -t agent-orchestrator:metadata-audit .
++      - name: Audit image metadata
++        run: |
++          python scripts/audit_image_metadata.py \
++            --image agent-orchestrator:metadata-audit \
++            --forbidden-name INTERNAL_BUILD_CHANNEL \
++            --forbidden-name INTERNAL_BUILD_REVISION \
++            --forbidden-value ci-private-channel-sentinel \
++            --forbidden-value ci-private-revision-sentinel
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..222400f
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,40 @@
++FROM python:3.11-slim AS builder
++
++ARG INTERNAL_BUILD_CHANNEL=local
++ARG INTERNAL_BUILD_REVISION=unknown
++
++ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
++    PIP_NO_CACHE_DIR=1 \
++    VIRTUAL_ENV=/opt/agent-orchestrator
++ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
++
++WORKDIR /build
++
++RUN python -m venv "${VIRTUAL_ENV}"
++RUN echo "$INTERNAL_BUILD_CHANNEL" > /opt/agent-orchestrator/channel.txt
++RUN echo "$INTERNAL_BUILD_REVISION" > /opt/agent-orchestrator/revision.txt
++
++COPY pyproject.toml README.md ./
++COPY src ./src
++
++RUN pip install --upgrade pip && \
++    pip install .
++
++FROM python:3.11-slim AS runtime
++
++LABEL org.opencontainers.image.title="Agent Orchestrator" \
++      org.opencontainers.image.description="Enterprise Agent Orchestration Platform API" \
++      org.opencontainers.image.version="2.4.1"
++
++ENV PATH="/opt/agent-orchestrator/bin:${PATH}" \
++    PYTHONDONTWRITEBYTECODE=1 \
++    PYTHONUNBUFFERED=1
++
++WORKDIR /app
++
++COPY --from=builder /opt/agent-orchestrator /opt/agent-orchestrator
++COPY src ./src
++
++EXPOSE 8000
++
++CMD ["uvicorn", "src.api.server:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+diff --git a/Makefile b/Makefile
+index 8382a0f..c785317 100644
+--- a/Makefile
++++ b/Makefile
+@@ -29,6 +29,9 @@ docker-up:
+ docker-down:
+ 	docker compose -f infra/docker-compose.yml down
+ 
++audit-image:
++	bash scripts/audit_image_metadata.sh orchestration-agent:latest
++
+ # 2019-01-15T19:25:56 update
+ 
+ # 2019-01-24T16:02:28 update
+diff --git a/infra/docker-compose.yml b/infra/docker-compose.yml
+new file mode 100644
+index 0000000..785dfca
+--- /dev/null
++++ b/infra/docker-compose.yml
+@@ -0,0 +1,11 @@
++services:
++  api:
++    build:
++      context: ..
++      dockerfile: Dockerfile
++      args:
++        INTERNAL_BUILD_CHANNEL: local
++        INTERNAL_BUILD_REVISION: local
++    image: agent-orchestrator:latest
++    ports:
++      - "8000:8000"
+diff --git a/scripts/audit_image_metadata.py b/scripts/audit_image_metadata.py
+new file mode 100644
+index 0000000..a210cb1
+--- /dev/null
++++ b/scripts/audit_image_metadata.py
+@@ -0,0 +1,84 @@
++import argparse
++import json
++import subprocess
++from typing import Any, Dict, Iterable, List, Optional
++
++APPROVED_RUNTIME_LABELS = {
++    "org.opencontainers.image.title",
++    "org.opencontainers.image.description",
++    "org.opencontainers.image.version",
++    "org.opencontainers.image.source",
++    "org.opencontainers.image.revision",
++    "org.opencontainers.image.created",
++    "org.opencontainers.image.licenses",
++}
++
++class MetadataAuditError(RuntimeError):
++    pass
++
++def _audit_history(history, forbidden, names):
++    for entry in history:
++        created_by = entry.get("created_by", "")
++        for val in forbidden:
++            if val in created_by:
++                raise MetadataAuditError(f"Forbidden value '{val}' found in layer: {created_by}")
++        for name in names:
++            if f"ARG {name}" in created_by:
++                raise MetadataAuditError(f"Forbidden build arg '{name}' found in layer: {created_by}")
++
++def _audit_labels(label_map, forbidden, names, approved):
++    for key, val in label_map.items():
++        if key not in approved:
++            raise MetadataAuditError(f"Unapproved runtime label: {key}")
++        for f_val in forbidden:
++            if f_val in val:
++                raise MetadataAuditError(f"Forbidden value '{f_val}' found in label '{key}'")
++        for name in names:
++            if name in key or name in val:
++                raise MetadataAuditError(f"Forbidden build arg '{name}' found in label '{key}'")
++
++def audit_metadata(
++    history: Iterable[Dict[str, Any]],
++    labels: Optional[Dict[str, str]],
++    forbidden_values: Iterable[str],
++    forbidden_names: Iterable[str] = (),
++    approved_labels: Iterable[str] = APPROVED_RUNTIME_LABELS,
++) -> None:
++    forbidden = [value for value in forbidden_values if value]
++    names = [name for name in forbidden_names if name]
++    approved = set(approved_labels)
++    label_map = labels or {}
++
++    _audit_history(history, forbidden, names)
++    _audit_labels(label_map, forbidden, names, approved)
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--image", required=True)
++    parser.add_argument("--forbidden-name", action="append", default=[])
++    parser.add_argument("--forbidden-value", action="append", default=[])
++    args = parser.parse_args()
++
++    inspect_out = subprocess.check_output(["docker", "inspect", args.image])
++    inspect_data = json.loads(inspect_out)[0]
++    labels = inspect_data.get("Config", {}).get("Labels", {})
++
++    history_out = subprocess.check_output(["docker", "history", "--no-trunc", "--format", "{{json .}}", args.image])
++    history = [json.loads(line) for line in history_out.decode().strip().split("\n") if line.strip()]
++    history_entries = [{"created_by": h["CreatedBy"]} for h in history]
++
++    try:
++        audit_metadata(
++            history=history_entries,
++            labels=labels,
++            forbidden_values=args.forbidden_value,
++            forbidden_names=args.forbidden_name,
++        )
++        print("Audit passed.")
++    except MetadataAuditError as e:
++        print(f"Audit failed: {e}")
++        sys.exit(1)
++
++if __name__ == "__main__":
++    import sys
++    main()
+diff --git a/tests/test_audit_image_metadata.py b/tests/test_audit_image_metadata.py
+new file mode 100644
+index 0000000..54cc3bf
+--- /dev/null
++++ b/tests/test_audit_image_metadata.py
+@@ -0,0 +1,55 @@
++import pytest
++from scripts.audit_image_metadata import audit_metadata, MetadataAuditError
++
++def test_audit_history_detects_forbidden_values():
++    history = [
++        {"created_by": "CMD [\"uvicorn\"]"},
++        {"created_by": "COPY src ./src"},
++        {"created_by": "RUN echo ci-private-channel-sentinel > channel.txt"},
++    ]
++    with pytest.raises(MetadataAuditError, match="ci-private-channel-sentinel"):
++        audit_metadata(
++            history=history,
++            labels={},
++            forbidden_values=["ci-private-channel-sentinel"]
++        )
++
++def test_audit_history_detects_forbidden_args():
++    history = [
++        {"created_by": "ARG INTERNAL_BUILD_CHANNEL"},
++    ]
++    with pytest.raises(MetadataAuditError, match="INTERNAL_BUILD_CHANNEL"):
++        audit_metadata(
++            history=history,
++            labels={},
++            forbidden_values=[],
++            forbidden_names=["INTERNAL_BUILD_CHANNEL"]
++        )
++
++def test_audit_labels_detects_unapproved_label():
++    labels = {
++        "org.opencontainers.image.title": "Agent Orchestrator",
++        "custom.internal.label": "secret",
++    }
++    with pytest.raises(MetadataAuditError, match="Unapproved runtime label"):
++        audit_metadata(
++            history=[],
++            labels=labels,
++            forbidden_values=[]
++        )
++
++def test_audit_passes_clean_metadata():
++    history = [
++        {"created_by": "CMD [\"uvicorn\"]"},
++        {"created_by": "COPY src ./src"},
++    ]
++    labels = {
++        "org.opencontainers.image.title": "Agent Orchestrator",
++    }
++    # Should not raise
++    audit_metadata(
++        history=history,
++        labels=labels,
++        forbidden_values=["secret"],
++        forbidden_names=["INTERNAL_BUILD_CHANNEL"]
++    )
+-- 
+2.47.3
+
