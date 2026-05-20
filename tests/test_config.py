@@ -3,6 +3,13 @@ from src.common.config import Config
 
 
 class TestConfig:
+
+    def test_boolean_coercion(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURE_ENABLED", "false")
+        monkeypatch.setenv("AO_OTHER_FEATURE", "true")
+        config = Config()
+        assert config.get("feature.enabled") is False
+        assert config.get("other.feature") is True
     def test_load_config(self, tmp_path):
         config_file = tmp_path / "config.json"
         config_file.write_text('{"app": {"name": "test", "port": 8080}}')
