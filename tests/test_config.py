@@ -24,6 +24,20 @@ class TestConfig:
         config.set("a.b.c.d", "value")
         assert config.get("a.b.c.d") == "value"
 
+    def test_get_int(self):
+        config = Config()
+        config.set("numeric.string", "42")
+        config.set("numeric.int", 100)
+        config.set("numeric.invalid", "not_a_number")
+
+        assert config.get_int("numeric.string") == 42
+        assert config.get_int("numeric.int") == 100
+        assert config.get_int("numeric.missing", 99) == 99
+
+        with pytest.raises(ValueError) as excinfo:
+            config.get_int("numeric.invalid")
+        assert "must be an integer" in str(excinfo.value)
+
     def test_to_dict(self):
         config = Config()
         config.set("key1", "value1")

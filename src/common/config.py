@@ -44,6 +44,15 @@ class Config:
                 return default
         return current
 
+    def get_int(self, key: str, default: Optional[int] = None) -> Optional[int]:
+        value = self.get(key)
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Config key '{key}' must be an integer, got {type(value).__name__} '{value}'") from e
+
     def set(self, key: str, value: Any) -> None:
         self._set_nested(key, value)
 
