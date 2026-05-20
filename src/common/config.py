@@ -21,6 +21,14 @@ class Config:
         for key, value in os.environ.items():
             if key.startswith(prefix):
                 config_key = key[len(prefix):].lower().replace("_", ".")
+
+                # Coerce boolean values
+                val_lower = value.strip().lower()
+                if val_lower == "true":
+                    value = True
+                elif val_lower == "false":
+                    value = False
+
                 self._set_nested(config_key, value)
 
     def _set_nested(self, key: str, value: Any) -> None:
