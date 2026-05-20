@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -23,6 +22,18 @@ class TestConfig:
         config = Config()
         config.set("a.b.c.d", "value")
         assert config.get("a.b.c.d") == "value"
+
+    def test_env_overrides(self):
+        import os
+        os.environ["AO_CFG_FEATURE_ENABLED"] = "true"
+        os.environ["AO_AGENT_ID"] = "1234"
+
+        config = Config()
+        assert config.get("feature.enabled") == "true"
+        assert config.get("agent.id") is None
+
+        del os.environ["AO_CFG_FEATURE_ENABLED"]
+        del os.environ["AO_AGENT_ID"]
 
     def test_to_dict(self):
         config = Config()
