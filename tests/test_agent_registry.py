@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -33,6 +32,27 @@ class TestAgentRegistry:
         self.registry.register("agent-2", "monitor.watcher")
         workers = self.registry.list(group="worker")
         assert len(workers) == 1
+
+    def test_list_agents_hides_disabled(self):
+        self.registry.register("agent-1", "worker.processor")
+
+        agent2_id = self.registry.register("agent-2", "worker.processor")
+        self.registry.update_status(agent2_id, AgentStatus.FAILED)
+
+        agent3_id = self.registry.register("agent-3", "worker.processor")
+        self.registry.update_status(agent3_id, AgentStatus.STOPPED)
+
+        agent4_id = self.registry.register("agent-4", "worker.processor")
+        self.registry.update_status(agent4_id, AgentStatus.TERMINATED)
+
+        # By default, disabled/failed/terminated agents should be hidden
+        active_agents = self.registry.list()
+        assert len(active_agents) == 1
+        assert active_agents[0]["name"] == "agent-1"
+
+        # When explicitly requested, all should be visible
+        all_agents = self.registry.list(include_disabled=True)
+        assert len(all_agents) == 4
 
     def test_update_status(self):
         agent_id = self.registry.register("test-agent", "worker.processor")

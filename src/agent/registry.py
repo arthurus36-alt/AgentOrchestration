@@ -1,6 +1,5 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum
@@ -45,8 +44,13 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None, include_disabled: bool = False) -> List[Dict[str, Any]]:
         agents = self._agents.values()
+
+        # Avoid leaking disabled entries in listings
+        if not include_disabled:
+            agents = [a for a in agents if a.get("status") not in [AgentStatus.STOPPED.value, AgentStatus.FAILED.value, AgentStatus.TERMINATED.value]]
+
         if status:
             agents = [a for a in agents if a["status"] == status.value]
         if group:
