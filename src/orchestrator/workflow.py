@@ -69,8 +69,9 @@ class WorkflowManager:
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
+            pinned_handler = step.handler
             try:
-                result = step.handler()
+                result = pinned_handler()
                 step.result = result
                 step.status = StepStatus.COMPLETED
             except Exception as e:
