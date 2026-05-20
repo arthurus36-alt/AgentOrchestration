@@ -7,6 +7,27 @@ from src.common.config import Config
 from src.common.logging import configure_logging
 
 
+
+def handle_init(args):
+    print(f"Initializing project: {args.name}")
+    return 0
+
+def handle_deploy(args):
+    import os
+    if not os.path.exists(args.manifest):
+        print(f"Error: Manifest file not found: {args.manifest}", file=sys.stderr)
+        return 1
+    print(f"Deploying agent from manifest: {args.manifest}")
+    return 0
+
+def handle_status(args):
+    print("Checking agent status...")
+    return 0
+
+def handle_logs(args):
+    print(f"Fetching logs for agent: {args.agent_id}")
+    return 0
+
 def cli():
     parser = argparse.ArgumentParser(description="Agent Orchestrator CLI")
     parser.add_argument("--config", "-c", help="Path to config file")
@@ -16,16 +37,20 @@ def cli():
 
     init_parser = subparsers.add_parser("init", help="Initialize a new project")
     init_parser.add_argument("name", help="Project name")
+    init_parser.set_defaults(func=handle_init)
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
+    deploy_parser.set_defaults(func=handle_deploy)
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
     status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
+    status_parser.set_defaults(func=handle_status)
 
     logs_parser = subparsers.add_parser("logs", help="View agent logs")
     logs_parser.add_argument("agent_id", help="Agent ID")
     logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
+    logs_parser.set_defaults(func=handle_logs)
 
     args = parser.parse_args()
 
@@ -34,23 +59,11 @@ def cli():
     else:
         configure_logging("INFO")
 
-    if args.command == "init":
-        print(f"Initializing project: {args.name}")
-    elif args.command == "deploy":
-        import os
-        if not os.path.exists(args.manifest):
-            print(f"Error: Manifest file not found: {args.manifest}", file=sys.stderr)
-            sys.exit(1)
-        print(f"Deploying agent from manifest: {args.manifest}")
-    elif args.command == "status":
-        print("Checking agent status...")
-    elif args.command == "logs":
-        print(f"Fetching logs for agent: {args.agent_id}")
+    if hasattr(args, 'func'):
+        sys.exit(args.func(args))
     else:
         parser.print_help()
         sys.exit(1)
-
-
 if __name__ == "__main__":
     cli()
 

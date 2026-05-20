@@ -19,7 +19,9 @@ def test_deploy_existing_manifest(tmp_path, capsys):
     
     test_args = ["main.py", "deploy", str(manifest_file)]
     with patch.object(sys, 'argv', test_args):
-        cli()
+        with pytest.raises(SystemExit) as e:
+            cli()
         
+        assert e.value.code == 0
         captured = capsys.readouterr()
         assert "Deploying agent from manifest" in captured.out
