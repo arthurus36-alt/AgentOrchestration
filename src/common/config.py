@@ -21,12 +21,18 @@ class Config:
         for key, value in os.environ.items():
             if key.startswith(prefix):
                 config_key = key[len(prefix):].lower().replace("_", ".")
-                if value.lower() in ("true", "1", "yes", "on"):
+                if value.lower() in ("true", "yes", "on"):
                     parsed_value = True
-                elif value.lower() in ("false", "0", "no", "off"):
+                elif value.lower() in ("false", "no", "off"):
                     parsed_value = False
                 else:
-                    parsed_value = value
+                    try:
+                        parsed_value = int(value)
+                    except ValueError:
+                        try:
+                            parsed_value = float(value)
+                        except ValueError:
+                            parsed_value = value
                 self._set_nested(config_key, parsed_value)
 
     def _set_nested(self, key: str, value: Any) -> None:

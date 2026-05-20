@@ -4,6 +4,15 @@ from src.common.config import Config
 
 class TestConfig:
 
+    def test_numeric_coercion(self, monkeypatch):
+        monkeypatch.setenv("AO_APP_PORT", "8080")
+        monkeypatch.setenv("AO_RETRY_DELAY", "1.5")
+        config = Config()
+        assert config.get("app.port") == 8080
+        assert config.get("retry.delay") == 1.5
+        assert isinstance(config.get("app.port"), int)
+        assert isinstance(config.get("retry.delay"), float)
+
     def test_boolean_coercion(self, monkeypatch):
         monkeypatch.setenv("AO_FEATURE_ENABLED", "false")
         monkeypatch.setenv("AO_OTHER_FEATURE", "true")
